@@ -18,48 +18,37 @@ def load_latent_action_model(model_path, device):
 class Encoder(nn.Module):
     """
     Encoder for VQ-VAE latent action model.
-    - Input: Concatenated current and next frames (B, 6, 160, 210) for RGB, or (B, 2, 160, 210) for grayscale.
-    - Output: Latent feature map (B, 128, 5, 7)
+    - Input: Concatenated current and next frames (B, 6, 84, 84) for RGB
+    - Output: Latent feature map (B, 128, 5, 5)
 
-    The architecture uses 5 Conv2d layers with stride=2 to downsample the input.
-    The kernel sizes and paddings are chosen to ensure the final output spatial size is exactly (5, 7) for input (160, 210).
+    The architecture uses 4 Conv2d layers with stride=2 to downsample the input.
+    The kernel sizes and paddings are chosen to ensure the final output spatial size is exactly (5, 5) for input (84, 84).
 
-    Downsampling calculation for (H, W) = (160, 210):
-    Layer 1: (160, 210) -> (80, 105)
-    Layer 2: (80, 105) -> (40, 53)
-    Layer 3: (40, 53) -> (20, 27)
-    Layer 4: (20, 27) -> (10, 14)
-    Layer 5: (10, 14) -> (5, 7)
-
-    The last Conv2d uses kernel_size=(4,7), stride=2, padding=(1,3) to ensure the width is exactly 7 (see calculation below):
-        output_width = floor((input_width + 2*padding - kernel_size) / stride) + 1
-        For input_width=14, kernel_size=7, padding=3, stride=2:
-        output_width = floor((14 + 6 - 7) / 2) + 1 = floor(13/2) + 1 = 6 + 1 = 7
+    Downsampling calculation for (H, W) = (84, 84):
+    Layer 1: (84, 84) -> (42, 42)
+    Layer 2: (42, 42) -> (21, 21)
+    Layer 3: (21, 21) -> (11, 11)
+    Layer 4: (11, 11) -> (5, 5)
     """
-    def __init__(self, in_channels=6, hidden_dims=[64, 128, 256, 512, 512], out_dim=128):
+    def __init__(self, in_channels=6, hidden_dims=[64, 128, 256, 512], out_dim=128):
         super().__init__()
         layers = []
         c_in = in_channels
         for i, c_out in enumerate(hidden_dims):
-            if i < 4:
-                # Standard downsampling: kernel=4, stride=2, padding=1
-                # This halves the spatial size each time
-                layers.append(nn.Conv2d(c_in, c_out, kernel_size=4, stride=2, padding=1))
-            else:
-                # Last layer: custom kernel for width to get (5, 7) output
-                # kernel_size=(4,7), stride=2, padding=(1,3)
-                # See docstring for calculation
-                layers.append(nn.Conv2d(c_in, c_out, kernel_size=(4,7), stride=2, padding=(1,3)))
+            # Standard downsampling: kernel=4, stride=2, padding=1
+            # This halves the spatial size each time
+            layers.append(nn.Conv2d(c_in, c_out, kernel_size=4, stride=2, padding=1))
             layers.append(nn.BatchNorm2d(c_out))
             layers.append(nn.ReLU(inplace=True))
             c_in = c_out
         self.conv = nn.Sequential(*layers)
         # Project to latent embedding dimension (128)
         self.project = nn.Conv2d(hidden_dims[-1], out_dim, kernel_size=1)
+    
     def forward(self, x):
         x = self.conv(x)
         x = self.project(x)
-        return x  # (B, 128, 5, 7)
+        return x  # (B, 128, 5, 5)
 
 class VectorQuantizer(nn.Module):
     """
@@ -76,39 +65,46 @@ class VectorQuantizer(nn.Module):
         self.commitment_cost = commitment_cost
         self.embeddings = nn.Embedding(num_embeddings, embedding_dim)
         self.embeddings.weight.data.uniform_(-1/num_embeddings, 1/num_embeddings)
+
     def forward(self, z):
         # z: (B, C, H, W)
         # Flatten spatial dimensions for vector quantization
-        z_flat = z.permute(0,2,3,1).contiguous().view(-1, self.embedding_dim)  # (B*H*W, C)
+        z_flat = z.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
+        z_flat = z_flat.view(-1, self.embedding_dim)  # (B*H*W, C)
+        
         # Compute L2 distance to codebook
         d = (z_flat.pow(2).sum(1, keepdim=True)
              - 2 * z_flat @ self.embeddings.weight.t()
              + self.embeddings.weight.pow(2).sum(1))
+        
+        # Get nearest codebook indices
         encoding_indices = torch.argmin(d, dim=1)
-        quantized = self.embeddings(encoding_indices).view(z.shape[0], z.shape[2], z.shape[3], self.embedding_dim)
-        quantized = quantized.permute(0,3,1,2).contiguous()
-        # Losses
+        
+        # Get quantized vectors
+        quantized = self.embeddings(encoding_indices)  # (B*H*W, C)
+        
+        # Reshape back to original dimensions
+        quantized = quantized.view(z.shape[0], z.shape[2], z.shape[3], self.embedding_dim)  # (B, H, W, C)
+        quantized = quantized.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
+        
+        # Compute losses
         commitment_loss = self.commitment_cost * F.mse_loss(quantized.detach(), z)
         codebook_loss = F.mse_loss(quantized, z.detach())
+        
         # Straight-through estimator
         quantized = z + (quantized - z).detach()
+        
         return quantized, encoding_indices.view(z.shape[0], z.shape[2], z.shape[3]), commitment_loss, codebook_loss
 
 class Decoder(nn.Module):
     """
     Decoder for VQ-VAE latent action model.
-    - Input: Quantized latent (B, 128, 5, 7) and current frame (B, 3, 160, 210)
-    - Output: Reconstructed next frame (B, 3, 160, 210)
+    - Input: Quantized latent (B, 128, 5, 5) and current frame (B, 3, 84, 84)
+    - Output: Reconstructed next frame (B, 3, 84, 84)
 
-    The decoder upsamples the latent representation back to the original frame size using 5 transposed conv layers.
-    - The upsampling path is symmetric to the encoder, but due to rounding, the output may not be exactly (160, 210).
-    - To guarantee the output is (160, 210), we use F.interpolate at the end.
-
-    Conditioning:
-    - The current frame is processed through a small conv net and concatenated with the latent before upsampling (FiLM-style conditioning).
-    - No skip connections are used (to enforce information bottleneck).
+    The decoder upsamples the latent representation back to the original frame size using 4 transposed conv layers.
     """
-    def __init__(self, in_channels=128, cond_channels=3, hidden_dims=[512, 512, 256, 128, 64], out_channels=3):
+    def __init__(self, in_channels=128, cond_channels=3, hidden_dims=[512, 256, 128, 64], out_channels=3):
         super().__init__()
         # Process current frame for conditioning
         self.cond_conv = nn.Sequential(
@@ -127,9 +123,10 @@ class Decoder(nn.Module):
             up_layers.append(nn.BatchNorm2d(c_out))
             up_layers.append(nn.ReLU(inplace=True))
             c_in = c_out
-        # Final upsampling to get close to (160, 210)
+        # Final upsampling to get to (84, 84)
         up_layers.append(nn.ConvTranspose2d(c_in, out_channels, kernel_size=4, stride=2, padding=1))
         self.up = nn.Sequential(*up_layers)
+    
     def forward(self, z, cond):
         # Process conditioning frame
         cond_feat = self.cond_conv(cond)
@@ -139,8 +136,8 @@ class Decoder(nn.Module):
         x = torch.cat([z, cond_feat], dim=1)
         x = self.fc(x)
         x = self.up(x)
-        # Guarantee output is (B, 3, 160, 210) by resizing
-        x = F.interpolate(x, size=(160, 210), mode='bilinear', align_corners=False)
+        # Guarantee output is (B, 3, 84, 84) by resizing
+        x = F.interpolate(x, size=(84, 84), mode='bilinear', align_corners=False)
         return x
 
 class LatentActionVQVAE(nn.Module):
@@ -152,28 +149,20 @@ class LatentActionVQVAE(nn.Module):
     """
     def __init__(self, codebook_size=256, embedding_dim=128, commitment_cost=0.25):
         super().__init__()
-        self.encoder = Encoder()
+        self.encoder = Encoder(out_dim=embedding_dim)
         self.vq = VectorQuantizer(num_embeddings=codebook_size, embedding_dim=embedding_dim, commitment_cost=commitment_cost)
-        self.decoder = Decoder()
+        self.decoder = Decoder(in_channels=embedding_dim)
 
     def forward(self, frame_t, frame_tp1, return_latent=False):
-        # Original frames: (B, C, 210, 160)
-        # Need to permute to: (B, C, 160, 210) for the model's internal processing
-        frame_t_permuted = frame_t.permute(0, 1, 3, 2)  # (B, C, 210, 160) -> (B, C, 160, 210)
-        frame_tp1_permuted = frame_tp1.permute(0, 1, 3, 2)  # (B, C, 210, 160) -> (B, C, 160, 210)
-        
+        # Input frames are already in (B, C, 84, 84) format
         # Concatenate along channel dimension (dim=1)
-        x = torch.cat([frame_t_permuted, frame_tp1_permuted], dim=1)  # (B, 2*C, 160, 210)
+        x = torch.cat([frame_t, frame_tp1], dim=1)  # (B, 2*C, 84, 84)
         
-        z = self.encoder(x)  # (B, 128, 5, 7)
+        z = self.encoder(x)  # (B, 128, 5, 5)
         quantized, indices, commitment_loss, codebook_loss = self.vq(z)
         
-        # The decoder expects permuted input
-        recon_permuted = self.decoder(quantized, frame_t_permuted)
-        
-        # IMPORTANT: Permute back to match original frame shape (B, C, 210, 160)
-        # We need to explicitly do this to ensure the output matches the target shape
-        recon = recon_permuted.permute(0, 1, 3, 2)  # (B, C, 160, 210) -> (B, C, 210, 160)
+        # Decode using current frame as conditioning
+        recon = self.decoder(quantized, frame_t)
         
         if return_latent:
             return recon, indices, commitment_loss, codebook_loss, z

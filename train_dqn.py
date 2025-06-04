@@ -29,6 +29,9 @@ config = {
     'min_buffer': 100000,
     'seed': 42,
     'epsilon': 0.1,  # Epsilon for epsilon-greedy exploration
+    'per_alpha': 0.6,  # Alpha for Prioritized Experience Replay
+    'per_beta_start': 0.4,  # Initial beta for PER
+    'per_beta_frames': 1000000,  # Frames over which to anneal beta for PER
 }
 
 # Set seeds and deterministic flags
@@ -37,6 +40,15 @@ torch.manual_seed(config['seed'])
 random.seed(config['seed'])
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+
+# Determine device
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+print(f"Using device: {device}")
 
 
 def save_episode_data(frames, actions, rewards, skill_level, episode_idx, config):
@@ -124,6 +136,7 @@ def main():
     parser.add_argument('--save_freq', type=int, default=None)
     parser.add_argument('--no_save', action='store_true', help='Do not save frames or actions during training')
     parser.add_argument('--exploration_mode', type=str, choices=['epsilon'], default='epsilon', help='Exploration mode: epsilon-greedy (default)')
+    parser.add_argument('--use_per', action='store_true', help='Use Prioritized Experience Replay and beta annealing')
     args = parser.parse_args()
     # Override config if args provided
     if args.max_episodes is not None:
@@ -142,20 +155,30 @@ def main():
     # --- Exploration Mode Setup ---
     exploration_mode = args.exploration_mode
     if exploration_mode == 'epsilon':
-        agent = DQNAgent(
-            n_actions=config['n_actions'],
-            state_shape=config['state_shape'],
-            prioritized=False,  # Use random replay buffer
-        )
+        agent_params = {
+            'n_actions': config['n_actions'],
+            'state_shape': config['state_shape'],
+            'device': device,
+        }
+        if args.use_per:
+            agent_params['prioritized'] = True
+            agent_params['per_alpha'] = config['per_alpha']
+            agent_params['per_beta'] = config['per_beta_start']
+            print("INFO: Using Prioritized Experience Replay with beta annealing.")
+        else:
+            agent_params['prioritized'] = False
+            print("INFO: Using standard Experience Replay (no PER).")
+        
+        agent = DQNAgent(**agent_params)
         epsilon_start = 1.0
         epsilon_final = 0.1
         epsilon_decay_steps = 1_000_000
     else:
         shared_replay_buffer = ReplayBuffer(capacity=1000000)
-        exploration_agent = DQNAgent(n_actions=config['n_actions'], state_shape=config['state_shape'], replay_buffer=shared_replay_buffer)
-        exploitation_agent = DQNAgent(n_actions=config['n_actions'], state_shape=config['state_shape'], replay_buffer=shared_replay_buffer)
+        exploration_agent = DQNAgent(n_actions=config['n_actions'], state_shape=config['state_shape'], replay_buffer=shared_replay_buffer, device=device)
+        exploitation_agent = DQNAgent(n_actions=config['n_actions'], state_shape=config['state_shape'], replay_buffer=shared_replay_buffer, device=device)
         from rnd import RandomNetworkDistillation
-        rnd = RandomNetworkDistillation(state_shape=config['state_shape'], output_dim=512, lr=1e-5, reward_scale=0.1)
+        rnd = RandomNetworkDistillation(state_shape=config['state_shape'], output_dim=512, lr=1e-5, reward_scale=0.1, device=device)
         alpha = 0.5
         alpha_decay = 0.99995
         min_alpha = 0.05
@@ -169,6 +192,7 @@ def main():
     pbar = trange(config['max_episodes'], desc='Training')
 
     epsilon = max(epsilon_final, epsilon_start - (epsilon_start - epsilon_final) * min(1.0, total_steps / epsilon_decay_steps))
+    current_beta = config['per_beta_start'] if args.use_per else None # Initialize for logging
 
     # Fill replay buffer with random actions first
     print("Pre-filling replay buffer with random experiences...")
@@ -221,6 +245,14 @@ def main():
         total_extrinsic_reward = 0
         done = False
         if exploration_mode == 'epsilon':
+            if args.use_per:
+                # Anneal PER beta
+                beta_progress = min(1.0, total_steps / config['per_beta_frames'])
+                current_beta = config['per_beta_start'] + beta_progress * (1.0 - config['per_beta_start'])
+                agent.anneal_per_beta(current_beta)
+            else:
+                current_beta = None # Ensure it's None if PER is not used
+
             for step in range(config['max_steps']):
                 # Epsilon annealing
                 epsilon = max(epsilon_final, epsilon_start - (epsilon_start - epsilon_final) * min(1.0, total_steps / epsilon_decay_steps))
@@ -355,6 +387,7 @@ def main():
                     'train/running_loss': np.mean(running_losses) if running_losses else 0,
                     'train/running_td_error': np.mean(running_td_errors) if running_td_errors else 0,
                     'train/epsilon': epsilon if exploration_mode == 'epsilon' else None,
+                    'train/per_beta': current_beta if args.use_per and exploration_mode == 'epsilon' and agent.prioritized else None,
                     'train/alpha': alpha if exploration_mode != 'epsilon' else None,
                     'train/episode': episode,
                     'policy/weight_norm': weight_norms['policy_weight_norm'],

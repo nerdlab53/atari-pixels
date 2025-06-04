@@ -367,11 +367,17 @@ class DQNAgent:
         
         # Calculate TD errors and loss
         td_errors = q_values - target_q
-        mean_td = td_errors.abs().mean().item()
         
         # Use Huber loss for stability
-        loss = nn.HuberLoss()(q_values, target_q)
+        if self.prioritized and weights is not None:
+            # Element-wise Huber loss
+            elementwise_loss = nn.functional.huber_loss(q_values, target_q, reduction='none')
+            loss = (weights * elementwise_loss).mean()
+        else:
+            loss = nn.functional.huber_loss(q_values, target_q, reduction='mean') # Original Huber loss
         
+        mean_td_for_return = td_errors.abs().mean().item() # Keep this for logging if needed
+
         # Backpropagation
         self.optimizer.zero_grad()
         loss.backward()
@@ -387,13 +393,18 @@ class DQNAgent:
         # Update weights
         self.optimizer.step()
         
+        # Update priorities in PER
+        if self.prioritized and idxs is not None:
+            abs_td_errors = td_errors.abs().squeeze().detach().cpu().numpy()
+            self.replay_buffer.update_priorities(idxs, abs_td_errors)
+        
         # Check for NaN after updating
         if any(torch.isnan(p).any() for p in self.policy_net.parameters()):
             print("WARNING: NaN detected in weights! Restoring from target network.")
             self.policy_net.load_state_dict(self.target_net.state_dict())
             return None
         
-        return loss.item(), mean_td
+        return loss.item(), mean_td_for_return
 
     def update_target_network(self):
         """Copy policy network weights to target network.
@@ -402,7 +413,10 @@ class DQNAgent:
         Too frequent updates can lead to unstable training,
         while too infrequent updates can lead to stale targets.
         """
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+        if hasattr(self.policy_net, '_orig_mod'): # Check if policy_net is compiled
+            self.target_net.load_state_dict(self.policy_net._orig_mod.state_dict())
+        else:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def anneal_per_beta(self, new_beta):
         if self.prioritized and hasattr(self.replay_buffer, 'anneal_beta'):
