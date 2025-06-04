@@ -238,9 +238,11 @@ class DQNCNN(nn.Module):
 
     def forward(self, x):
         """Forward pass normalizes inputs and computes Q-values using Dueling architecture."""
-        x = x.float() / 255.0  # Normalize pixel values
+        # At this point, x should be (1, 8, 84, 84) for evaluation, or (batch_size, 8, 84, 84) for training.
+        # print(f"DQNCNN input x shape: {x.shape}") # <<< ADD THIS DEBUG PRINT
+        x = x.float() / 255.0
+        print(f"Input shape to self.conv: {x.shape}") # DEBUG PRINT
         features = self.conv(x)
-        features = features.view(features.size(0), -1) # Flatten features
 
         value = self.value_stream(features)
         advantages = self.advantage_stream(features)
