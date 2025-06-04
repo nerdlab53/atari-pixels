@@ -308,8 +308,18 @@ class DQNAgent:
         self.target_net.to(self.device)
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
         # Compile for speed if available and on CUDA only
-        if hasattr(torch, 'compile') and self.device.type == 'cuda':
-            self.policy_net = torch.compile(self.policy_net)
+        # if hasattr(torch, 'compile') and self.device.type == 'cuda':
+        #     print("INFO: Attempting to compile policy_net with torch.compile...")
+        #     try:
+        #         self.policy_net = torch.compile(self.policy_net)
+        #         print("INFO: policy_net successfully compiled.")
+        #     except Exception as e:
+        #         print(f"WARNING: torch.compile failed for policy_net: {e}")
+        # else:
+        #     if self.device.type != 'cuda':
+        #         print("INFO: torch.compile skipped for policy_net (not on CUDA device).")
+        #     else:
+        #         print("INFO: torch.compile skipped for policy_net (torch.compile not available).")
 
     def select_action(self, state, mode: str = 'greedy', temperature: float = 1.0, epsilon: float = 0.0) -> int:
         """
