@@ -131,11 +131,11 @@ def evaluate_agent(agent, env, n_episodes=10, log_id=None, return_q_values=False
     all_q_values = []
     for ep in range(n_episodes):
         obs, info = env.reset()
-        state_stack = np.stack([obs] * 8, axis=0)
+        state_stack = np.array(obs)
         done = False
         total_reward = 0
         for step in range(config['max_steps']):
-            state_tensor = torch.from_numpy(state_stack).unsqueeze(0).to(agent.device)
+            state_tensor = torch.from_numpy(state_stack.astype(np.float32)).unsqueeze(0).to(agent.device)
             agent.policy_net.eval()
             with torch.no_grad():
                 q_values_tensor = agent.policy_net(state_tensor)
@@ -157,8 +157,7 @@ def evaluate_agent(agent, env, n_episodes=10, log_id=None, return_q_values=False
                 'reward': reward
             })
             all_q_values.append(q_values)
-            state_stack = np.roll(state_stack, shift=-1, axis=0)
-            state_stack[-1] = next_obs
+            state_stack = np.array(next_obs)
             total_reward += reward
             done = terminated or truncated
             if done:
@@ -304,7 +303,7 @@ def main():
             policy_str = ""
 
         obs, info = env.reset()
-        state_stack = np.stack([obs] * 8, axis=0)
+        state_stack = np.array(obs)
         frames, actions, extrinsic_rewards, intrinsic_rewards = [obs[-1]], [], [], [] # Store last frame of initial stack
         total_combined_reward = 0
         total_extrinsic_reward = 0
