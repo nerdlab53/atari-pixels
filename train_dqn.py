@@ -2,7 +2,9 @@ import os
 import numpy as np
 import torch
 from tqdm import trange
-from atari_env import AtariBreakoutEnv
+import gymnasium as gym
+from gymnasium.core import ObservationWrapper
+from gymnasium.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 from dqn_agent import DQNAgent, ReplayBuffer
 import cv2
 import json
@@ -16,10 +18,10 @@ from collections import deque
 
 # Config
 config = {
-    'env_name': 'Breakout',
-    'n_actions': 4,
+    'env_name': 'ALE/MsPacman-v5',
+    'n_actions': 9,
     'state_shape': (8, 84, 84),
-    'max_episodes': 10000,
+    'max_episodes': 2000,
     'max_steps': 1000,
     'target_update_freq': 10000, #since i'm doing 5 update steps per environment step, this means 200*5=1000 steps between target network updates
     'checkpoint_dir': 'checkpoints',
@@ -50,6 +52,55 @@ else:
     device = torch.device("cpu")
 print(f"Using device: {device}")
 
+# --- Generic Atari Environment --- #
+class AtariEnv:
+    def __init__(self, game_id='ALE/Breakout-v5', screen_height=84, screen_width=84, num_stack=8, seed=None, render_mode=None):
+        if seed is not None:
+            self.env = gym.make(game_id, obs_type="grayscale", render_mode=render_mode, full_action_space=False)
+            # For full_action_space=False, Breakout has 4 actions, MsPacman has 9 actions.
+            # For full_action_space=True, Breakout has 18 actions, MsPacman has 18 actions.
+        else:
+            self.env = gym.make(game_id, obs_type="grayscale", render_mode=render_mode, full_action_space=False)
+        
+        self.env = ResizeObservation(self.env, shape=(screen_height, screen_width))
+        # GrayScaleObservation is applied by obs_type="grayscale" in make, FrameStack handles num_stack
+        # self.env = GrayScaleObservation(self.env, keep_dim=False) # keep_dim=False removes the channel dim
+        # FrameStack expects a single channel image (H, W) if keep_dim=False for GrayScaleObservation
+        # or (H, W, 1) if keep_dim=True. Since obs_type="grayscale" gives (H,W), FrameStack works directly.
+        
+        # Note: FrameStack will stack on axis 0 by default, so (num_stack, H, W)
+        self.env = FrameStack(self.env, num_stack=num_stack)
+        self.observation_space = self.env.observation_space
+        self.action_space = self.env.action_space
+        self.render_mode = render_mode
+
+    def reset(self, seed=None, options=None):
+        # Gymnasium's FrameStack stacks on axis 0 automatically.
+        # The observation from FrameStack is already a LazyFrames object containing stacked frames.
+        obs, info = self.env.reset(seed=seed, options=options)
+        # No need to manually stack: obs is already (num_stack, H, W)
+        return np.array(obs), info 
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        # obs is already (num_stack, H, W)
+        return np.array(obs), reward, terminated, truncated, info
+
+    def render(self):
+        if self.render_mode:
+            return self.env.render()
+
+    def close(self):
+        self.env.close()
+
+    def get_action_meanings(self):
+        if hasattr(self.env, 'get_action_meanings'):
+            return self.env.get_action_meanings()
+        elif hasattr(self.env.unwrapped, 'get_action_meanings'):
+            return self.env.unwrapped.get_action_meanings()
+        return [f"ACTION_{i}" for i in range(self.action_space.n)]
+
+# --- End Generic Atari Environment --- #
 
 def save_episode_data(frames, actions, rewards, skill_level, episode_idx, config):
     """Save frames as PNGs and actions/rewards as JSON."""
@@ -149,8 +200,14 @@ def main():
     os.makedirs(config['data_dir'], exist_ok=True)
     os.makedirs(config['actions_dir'], exist_ok=True)
 
+    # --- Determine run suffix for naming --- #
+    # Extract a short game name, e.g., MsPacman from ALE/MsPacman-v5
+    short_game_name = config['env_name'].split('/')[-1].split('-')[0]
+    per_suffix = "_PER" if args.use_per else "_NoPER"
+    run_name_suffix = f"{short_game_name}{per_suffix}"
+
     # --- wandb setup ---
-    wandb.init(project="atari-dqn", config=config, name=f"DQN_{config['env_name']}")
+    wandb.init(project="atari-drl-experiments", config=config, name=f"DQN_{run_name_suffix}_{time.strftime('%Y%m%d_%H%M%S')}")
 
     # --- Exploration Mode Setup ---
     exploration_mode = args.exploration_mode
@@ -196,9 +253,19 @@ def main():
 
     # Fill replay buffer with random actions first
     print("Pre-filling replay buffer with random experiences...")
-    env = AtariBreakoutEnv()
-    obs, info = env.reset()
-    state_stack = np.stack([obs] * 8, axis=0)
+    env = AtariEnv(game_id=config['env_name'], num_stack=config['state_shape'][0], seed=config['seed'])
+    print(f"Initialized environment: {config['env_name']}")
+    print(f"Action space size: {env.action_space.n}")
+    # Ensure config n_actions matches env action space
+    if config['n_actions'] != env.action_space.n:
+        print(f"WARNING: config n_actions ({config['n_actions']}) does not match env action space ({env.action_space.n}). Updating config.")
+        config['n_actions'] = env.action_space.n
+        # Re-initialize agent_params if n_actions changed for the DQNAgent
+        # This is important if agent was already initialized before this check
+        # However, agent is initialized after this block, so it should be fine.
+
+    obs, info = env.reset(seed=config['seed'])
+    state_stack = obs # obs from AtariEnv with FrameStack is already (num_stack, H, W)
     replay_buffer = agent.replay_buffer if exploration_mode == 'epsilon' else shared_replay_buffer
     for step in range(max(5000, config['min_buffer'])):
         action = np.random.randint(0, config['n_actions'])
@@ -218,7 +285,7 @@ def main():
         if step % 1000 == 0:
             print(f"  {step}/{max(5000, config['min_buffer'])} experiences collected")
 
-    eval_env = AtariBreakoutEnv()
+    eval_env = AtariEnv(game_id=config['env_name'], num_stack=config['state_shape'][0], seed=config['seed']+1) # Use a different seed for eval
 
     window_size_for_logs = 30
     running_losses = deque(maxlen=window_size_for_logs)
@@ -240,7 +307,7 @@ def main():
 
         obs, info = env.reset()
         state_stack = np.stack([obs] * 8, axis=0)
-        frames, actions, extrinsic_rewards, intrinsic_rewards = [obs], [], [], []
+        frames, actions, extrinsic_rewards, intrinsic_rewards = [obs[0]], [], [], []
         total_combined_reward = 0
         total_extrinsic_reward = 0
         done = False
@@ -369,8 +436,21 @@ def main():
             # Log to wandb
             try:
                 # Get weight and grad norms
-                weight_norms = agent.get_weight_norms()
-                grad_norms = agent.get_grad_norms()
+                # Determine which agent to get norms from based on exploration mode
+                current_active_agent = None
+                if exploration_mode == 'epsilon':
+                    current_active_agent = agent
+                elif exploration_mode != 'epsilon': # RND mode
+                    current_active_agent = exploitation_agent # Or exploration_agent, depending on what you want to track
+                
+                if current_active_agent is not None:
+                    weight_norms = current_active_agent.get_weight_norms()
+                    grad_norms = current_active_agent.get_grad_norms()
+                else:
+                    # Fallback or handle if no agent is active (should not happen in current logic)
+                    weight_norms = {'policy_weight_norm': 0, 'target_weight_norm': 0, 'policy_max_weight': 0, 'policy_min_weight': 0}
+                    grad_norms = {'policy_grad_norm': 0, 'target_grad_norm': 0}
+
                 wandb.log({
                     'eval/total_steps': total_steps,
                     'eval/episode': episode,
@@ -402,20 +482,44 @@ def main():
             
             log_into_wandb=False
         
-        if episode % config['save_freq'] == 0:
-            checkpoint_path = os.path.join(config['checkpoint_dir'], 'dqn_latest.pth')
-            torch.save(agent.policy_net.state_dict(), checkpoint_path)
-            param_count = sum(p.numel() for p in agent.policy_net.parameters())
-            param_sum = sum(p.sum().item() for p in agent.policy_net.parameters())
+        if episode % config['save_freq'] == 0 and episode > 0: # Avoid saving at episode 0 before any training
+            checkpoint_path = os.path.join(config['checkpoint_dir'], f'dqn_{run_name_suffix}_ep{episode}.pth')
+            # Save the policy net of the relevant agent
+            if exploration_mode == 'epsilon':
+                torch.save(agent.policy_net.state_dict(), checkpoint_path)
+            elif exploration_mode != 'epsilon': # RND mode
+                # Decide which agent to save, e.g., exploitation agent for final policy
+                torch.save(exploitation_agent.policy_net.state_dict(), checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path} at episode {episode}")
+
+            # Save a generic latest as well
+            latest_checkpoint_path = os.path.join(config['checkpoint_dir'], f'dqn_{run_name_suffix}_latest.pth')
+            if exploration_mode == 'epsilon':
+                torch.save(agent.policy_net.state_dict(), latest_checkpoint_path)
+            elif exploration_mode != 'epsilon':
+                torch.save(exploitation_agent.policy_net.state_dict(), latest_checkpoint_path)
+            # print(f"Updated latest checkpoint to {latest_checkpoint_path}")
 
     eval_env.close()
-    checkpoint_path = os.path.join(config['checkpoint_dir'], 'dqn_latest.pth')
-    torch.save(agent.policy_net.state_dict(), checkpoint_path)
-    param_count = sum(p.numel() for p in agent.policy_net.parameters())
-    param_sum = sum(p.sum().item() for p in agent.policy_net.parameters())
-    print(f"\nSaved final model to {checkpoint_path}")
-    print(f"Parameter count: {param_count:,}")
-    print(f"Parameter sum: {param_sum:.2f}")
+    final_checkpoint_path = os.path.join(config['checkpoint_dir'], f'dqn_{run_name_suffix}_final_ep{config["max_episodes"]}.pth')
+    
+    # Save the final model based on exploration mode
+    final_agent_to_save = None
+    if exploration_mode == 'epsilon':
+        final_agent_to_save = agent
+    elif exploration_mode != 'epsilon': # RND mode
+        final_agent_to_save = exploitation_agent # Typically save the exploitation policy
+
+    if final_agent_to_save is not None:
+        torch.save(final_agent_to_save.policy_net.state_dict(), final_checkpoint_path)
+        param_count = sum(p.numel() for p in final_agent_to_save.policy_net.parameters())
+        param_sum = sum(p.sum().item() for p in final_agent_to_save.policy_net.parameters() if p.numel() > 0)
+        print(f"\nSaved final model to {final_checkpoint_path}")
+        print(f"Parameter count: {param_count:,}")
+        print(f"Parameter sum: {param_sum:.2f}")
+    else:
+        print("\nNo final agent model to save (check exploration_mode logic).")
+
     print("Training finished.")
 
 if __name__ == '__main__':

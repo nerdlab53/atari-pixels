@@ -186,12 +186,14 @@ class PrioritizedReplayBuffer:
         return len(self.tree)
 
 class DQNCNN(nn.Module):
-    """CNN architecture for DQN, based on the original DQN paper.
+    """CNN architecture for DQN, based on the original DQN paper, modified for Dueling DQN.
     
     Architecture:
     1. Input: (batch_size, 8, 84, 84) - 8 stacked frames
     2. Conv layers process spatial features
-    3. FC layers compute Q-values for each action
+    3. Split into Value and Advantage streams
+    4. FC layers in each stream
+    5. Combine V(s) and A(s,a) to get Q(s,a)
     """
     def __init__(self, input_shape, n_actions):
         super().__init__()
@@ -210,11 +212,21 @@ class DQNCNN(nn.Module):
         convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w, 8, 4), 4, 2), 3, 1)
         convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
         linear_input_size = convw * convh * 64
-        self.fc = nn.Sequential(
+
+        # Value stream
+        self.value_stream = nn.Sequential(
             nn.Linear(linear_input_size, 512),
             nn.ReLU(),
-            nn.Linear(512, n_actions)
+            nn.Linear(512, 1)  # Outputs a single scalar V(s)
         )
+
+        # Advantage stream
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(linear_input_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions) # Outputs advantage for each action
+        )
+        
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -225,11 +237,18 @@ class DQNCNN(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        """Forward pass normalizes inputs and computes Q-values."""
+        """Forward pass normalizes inputs and computes Q-values using Dueling architecture."""
         x = x.float() / 255.0  # Normalize pixel values
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+        features = self.conv(x)
+        features = features.view(features.size(0), -1) # Flatten features
+
+        value = self.value_stream(features)
+        advantages = self.advantage_stream(features)
+
+        # Combine V(s) and A(s,a) to get Q(s,a) = V(s) + (A(s,a) - mean(A(s,a')))
+        q_values = value + (advantages - advantages.mean(dim=1, keepdim=True))
+        
+        return q_values
 
 class DQNAgent:
     """Deep Q-Network agent implementing several DQN improvements.
