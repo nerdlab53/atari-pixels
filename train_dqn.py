@@ -206,7 +206,7 @@ def main():
     run_name_suffix = f"{short_game_name}{per_suffix}"
 
     # --- wandb setup ---
-    wandb.init(project="atari-drl-experiments", config=config, name=f"DQN_{run_name_suffix}_{time.strftime('%Y%m%d_%H%M%S')}")
+    wandb.init(project="atari-dqn", config=config, name=f"DQN_{run_name_suffix}_{time.strftime('%Y%m%d_%H%M%S')}")
 
     # --- Exploration Mode Setup ---
     exploration_mode = args.exploration_mode
