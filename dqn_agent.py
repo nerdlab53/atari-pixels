@@ -259,7 +259,7 @@ class DQNAgent:
        - Clips gradient norm to 1.0
        - Maintains stable updates
     """
-    def __init__(self, n_actions: int, state_shape, replay_buffer=None, prioritized=False, per_alpha=0.6, per_beta=0.4):
+    def __init__(self, n_actions: int, state_shape, replay_buffer=None, prioritized=False, per_alpha=0.6, per_beta=0.4, device=None):
         """Initialize DQN agent with networks and replay buffer."""
         self.n_actions = n_actions
         self.state_shape = state_shape
@@ -277,7 +277,9 @@ class DQNAgent:
         self.batch_size = 32
         self.learning_rate = 2.5e-4
         # Device selection
-        if torch.cuda.is_available():
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
             self.device = torch.device('cuda')
         elif torch.backends.mps.is_available():
             self.device = torch.device('mps')
