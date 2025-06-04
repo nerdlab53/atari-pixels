@@ -270,18 +270,16 @@ def main():
     for step in range(max(5000, config['min_buffer'])):
         action = np.random.randint(0, config['n_actions'])
         next_obs, reward, terminated, truncated, info = env.step(action)
-        next_state_stack = np.roll(state_stack, shift=-1, axis=0)
-        next_state_stack[-1] = next_obs
-        # Add small random priority variation during prefill
-        #random_priority = random.uniform(0.1, 1.0)
-        # For prefill, set intrinsic reward to 0
-        #replay_buffer.push(state_stack, action, reward, 0.0, next_state_stack, terminated or truncated, random_priority)
-        # state, action, extrinsic_reward, intrinsic_reward, next_state, done
+        
+        # next_state_stack = np.roll(state_stack, shift=-1, axis=0) # No longer needed
+        # next_state_stack[-1] = next_obs # Error was here
+        next_state_stack = next_obs # next_obs is already the new full stack
+
         replay_buffer.push(state_stack, action, reward, 0.0, next_state_stack, terminated or truncated)
         state_stack = next_state_stack
         if terminated or truncated:
-            obs, info = env.reset()
-            state_stack = np.stack([obs] * 8, axis=0)
+            obs, info = env.reset(seed=config['seed'] if step < 100 else None) # Re-seed for first few resets for consistency
+            state_stack = obs
         if step % 1000 == 0:
             print(f"  {step}/{max(5000, config['min_buffer'])} experiences collected")
 
@@ -307,7 +305,7 @@ def main():
 
         obs, info = env.reset()
         state_stack = np.stack([obs] * 8, axis=0)
-        frames, actions, extrinsic_rewards, intrinsic_rewards = [obs[0]], [], [], []
+        frames, actions, extrinsic_rewards, intrinsic_rewards = [obs[-1]], [], [], [] # Store last frame of initial stack
         total_combined_reward = 0
         total_extrinsic_reward = 0
         done = False
@@ -325,8 +323,11 @@ def main():
                 epsilon = max(epsilon_final, epsilon_start - (epsilon_start - epsilon_final) * min(1.0, total_steps / epsilon_decay_steps))
                 action = agent.select_action(state_stack, mode='epsilon', epsilon=epsilon)
                 next_obs, extrinsic_reward, terminated, truncated, info = env.step(action)
-                next_state_stack = np.roll(state_stack, shift=-1, axis=0)
-                next_state_stack[-1] = next_obs
+                
+                # next_state_stack = np.roll(state_stack, shift=-1, axis=0) # No longer needed
+                # next_state_stack[-1] = next_obs # Error was here
+                next_state_stack = next_obs # next_obs is already the new full stack
+                
                 agent.replay_buffer.push(state_stack, action, extrinsic_reward, 0.0, next_state_stack, terminated or truncated)
                 for _ in range(1):
                     result = agent.optimize_model(mode='exploitation')
@@ -335,7 +336,7 @@ def main():
                         losses.append(loss)
                         td_errors.append(td_error)
                 state_stack = next_state_stack
-                frames.append(next_obs)
+                frames.append(next_obs[-1]) # Store last frame of the new stack for visualization
                 actions.append(action)
                 extrinsic_rewards.append(extrinsic_reward)
                 total_extrinsic_reward += extrinsic_reward
@@ -374,8 +375,10 @@ def main():
             for step in range(config['max_steps']):
                 action = exploration_agent.select_action(state_stack, mode='softmax', temperature=1.0, epsilon=config['epsilon'])
                 next_obs, extrinsic_reward, terminated, truncated, info = env.step(action)
-                next_state_stack = np.roll(state_stack, shift=-1, axis=0)
-                next_state_stack[-1] = next_obs
+                # next_state_stack = np.roll(state_stack, shift=-1, axis=0) # No longer needed
+                # next_state_stack[-1] = next_obs # Error was here
+                next_state_stack = next_obs # next_obs is already the new full stack
+
                 intrinsic_reward = float(rnd.compute_intrinsic_reward(np.expand_dims(next_state_stack, axis=0)).cpu().numpy()[0])
                 shared_replay_buffer.push(state_stack, action, extrinsic_reward, intrinsic_reward, next_state_stack, terminated or truncated)
                 for _ in range(5):
@@ -393,7 +396,7 @@ def main():
                         states_np = np.stack(states)
                         rnd.update(states_np)
                 state_stack = next_state_stack
-                frames.append(next_obs)
+                frames.append(next_obs[-1]) # Store last frame of the new stack for visualization
                 actions.append(action)
                 extrinsic_rewards.append(extrinsic_reward)
                 intrinsic_rewards.append(intrinsic_reward)
