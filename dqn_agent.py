@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import random
+import math # For NoisyLinear
 
 class ReplayBuffer:
     """Experience replay buffer for DQN with support for intrinsic and extrinsic rewards."""
@@ -186,14 +187,13 @@ class PrioritizedReplayBuffer:
         return len(self.tree)
 
 class DQNCNN(nn.Module):
-    """CNN architecture for DQN, based on the original DQN paper, modified for Dueling DQN.
+    """CNN architecture for DQN, using Noisy Layers for the FC part.
     
     Architecture:
-    1. Input: (batch_size, 8, 84, 84) - 8 stacked frames
+    1. Input: (batch_size, C_in, H, W) - e.g., (N, 8, 84, 84) stacked frames
     2. Conv layers process spatial features
-    3. Split into Value and Advantage streams
-    4. FC layers in each stream
-    5. Combine V(s) and A(s,a) to get Q(s,a)
+    3. Flatten conv output
+    4. Fully connected layers (with NoisyLinear) compute Q-values for each action
     """
     def __init__(self, input_shape, n_actions):
         super().__init__()
@@ -213,18 +213,11 @@ class DQNCNN(nn.Module):
         convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
         linear_input_size = convw * convh * 64
 
-        # Value stream
-        self.value_stream = nn.Sequential(
-            nn.Linear(linear_input_size, 512),
+        # Standard DQN Fully Connected Stream (using NoisyLinear)
+        self.fc_stream = nn.Sequential(
+            NoisyLinear(linear_input_size, 512),
             nn.ReLU(),
-            nn.Linear(512, 1)  # Outputs a single scalar V(s)
-        )
-
-        # Advantage stream
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(linear_input_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, n_actions) # Outputs advantage for each action
+            NoisyLinear(512, n_actions) # Outputs Q-values for each action
         )
         
         self.apply(self._init_weights)
@@ -237,10 +230,10 @@ class DQNCNN(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        """Forward pass normalizes inputs and computes Q-values using Dueling architecture."""
-        # At this point, x should be (1, 8, 84, 84) for evaluation, or (batch_size, 8, 84, 84) for training.
-        # print(f"DQNCNN input x shape: {x.shape}") # <<< ADD THIS DEBUG PRINT
-        x = x.float() / 255.0
+        """Forward pass normalizes inputs and computes Q-values.
+        Assumes x is (N, C, H, W)
+        """
+        x = x.float() / 255.0  # Normalize pixel values
         # print(f"Input shape to self.conv: {x.shape}") # DEBUG PRINT (can be removed later)
         features = self.conv(x) 
         # print(f"Shape after self.conv: {features.shape}") # DEBUG PRINT
@@ -249,13 +242,65 @@ class DQNCNN(nn.Module):
         features = features.view(features.size(0), -1) 
         # print(f"Shape after flatten (view): {features.shape}") # DEBUG PRINT
 
-        value = self.value_stream(features)
-        advantages = self.advantage_stream(features)
-
-        # Combine V(s) and A(s,a) to get Q(s,a) = V(s) + (A(s,a) - mean(A(s,a')))
-        q_values = value + (advantages - advantages.mean(dim=1, keepdim=True))
+        q_values = self.fc_stream(features)
         
         return q_values
+
+# --- NoisyLinear Layer --- #
+class NoisyLinear(nn.Module):
+    """Noisy Linear Layer for Noisy Network exploration.
+    Factorized Gaussian noise is used here.
+    """
+    def __init__(self, in_features, out_features, std_init=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.std_init = std_init
+
+        # Learnable parameters for the mean of the weights and biases
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+
+        # Learnable parameters for the standard deviation of the noise for weights and biases
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+
+        # Non-learnable buffers for the noise (epsilon)
+        self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
+        self.register_buffer('bias_epsilon', torch.empty(out_features))
+
+        self.reset_parameters()
+        self.reset_noise()
+
+    def reset_parameters(self):
+        # Initialization similar to kaiming uniform but for NoisyNets
+        mu_range = 1 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+
+        self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
+        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features)) # Bias sigma init can differ
+
+    def _scale_noise(self, size):
+        # Factorized Gaussian noise: sign(x) * sqrt(|x|)
+        x = torch.randn(size, device=self.weight_mu.device)
+        return x.sign().mul_(x.abs().sqrt_())
+
+    def reset_noise(self):
+        epsilon_in = self._scale_noise(self.in_features)
+        epsilon_out = self._scale_noise(self.out_features)
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in)) # Outer product
+        self.bias_epsilon.copy_(epsilon_out) # Use same output noise for bias
+
+    def forward(self, x):
+        if not self.training: # For evaluation, use only the mean weights (no noise)
+            return nn.functional.linear(x, self.weight_mu, self.bias_mu)
+        
+        # During training, combine mean weights with noisy component
+        weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+        bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        
+        return nn.functional.linear(x, weight, bias)
 
 class DQNAgent:
     """Deep Q-Network agent implementing several DQN improvements.
@@ -329,45 +374,34 @@ class DQNAgent:
         #         print("INFO: torch.compile skipped for policy_net (torch.compile not available).")
 
     def select_action(self, state, mode: str = 'greedy', temperature: float = 1.0, epsilon: float = 0.0) -> int:
+        """Select action using the policy network.
+        With NoisyNets, exploration is implicit in the noisy weights during training.
+        Epsilon and temperature are no longer used for NoisyNets exploration.
+        The 'mode' parameter might be re-evaluated or simplified.
+        For training, policy_net should be in .train() mode to use noisy weights.
+        For evaluation, policy_net should be in .eval() mode to use mean weights.
         """
-        Select action using specified exploration strategy.
-        
-        Args:
-            state: Current state
-            mode: 'greedy' or 'softmax'
-            temperature: Temperature for softmax exploration
-            epsilon: Probability of random action (for training only)
-        """
-        
-        # Normal policy-based selection (without normalization)
         state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
-        self.policy_net.eval()
-        with torch.no_grad():
+        # self.policy_net.eval() # Old: for greedy/softmax without considering NoisyNet state
+        # For NoisyNets, the .train() or .eval() state of policy_net dictates noise.
+        # This should be set outside this function (e.g. before starting an episode or evaluation)
+        
+        with torch.no_grad(): # Q-value calculation should not affect gradients here
             q_values = self.policy_net(state_tensor)
-            if mode == 'softmax':
-                # Softmax action selection (Boltzmann exploration)
-                logits = q_values / max(temperature, 1e-6)
-                probs = torch.softmax(logits, dim=1)
-                action = int(torch.multinomial(probs, num_samples=1).item())
-            elif mode == 'epsilon':
-                if np.random.rand() < epsilon:
-                    action = np.random.randint(0, self.n_actions)
-                else:
-                    action = int(torch.argmax(q_values, dim=1).item())  
-            elif mode == 'greedy':
-                # Greedy with 5% random action
-                if np.random.rand() < 0.05:
-                    action = np.random.randint(0, self.n_actions)
-                else:
-                    action = int(torch.argmax(q_values, dim=1).item())
-            else:
-                action = int(torch.argmax(q_values, dim=1).item())
+            # Always act greedily on the (potentially noisy) Q-values
+            action = int(torch.argmax(q_values, dim=1).item())
         return action
 
     def optimize_model(self, mode: str = 'exploitation', alpha: float = 0.5):
         """Update policy network using double DQN algorithm with NaN protection."""
         if len(self.replay_buffer) < self.batch_size:
             return None
+        
+        # Set policy_net to training mode (enables noise in NoisyLinear, and dropout/bn if any)
+        self.policy_net.train()
+        # Reset noise for NoisyLinear layers before processing a batch
+        if hasattr(self, 'reset_noise'): # Check if method exists (for compatibility if NoisyNets not used)
+            self.reset_noise()
             
         # Sample from replay buffer
         batch = self.replay_buffer.sample(self.batch_size, mode=mode, alpha=alpha)
@@ -387,9 +421,6 @@ class DQNAgent:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
         next_states = torch.from_numpy(np.stack(next_states)).to(self.device).float()
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
-        
-        # Switch to training mode
-        self.policy_net.train()
         
         # Calculate current Q-values
         q_values = self.policy_net(states).gather(1, actions)
@@ -605,3 +636,14 @@ class DQNAgent:
             'policy_grad_norm': policy_grad_norm,
             'target_grad_norm': target_grad_norm
         }
+
+    def reset_noise(self):
+        """Resets the noise in all NoisyLinear layers of the policy network."""
+        # Important: Only reset noise for the policy_net, as target_net should be stable
+        # and typically uses the mean weights if it were also noisy (though usually not needed for target).
+        # If policy_net is compiled, self.policy_net might be the compiled wrapper.
+        # We need to access the original module if it exists.
+        net_to_reset = self.policy_net._orig_mod if hasattr(self.policy_net, '_orig_mod') else self.policy_net
+        for module in net_to_reset.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
