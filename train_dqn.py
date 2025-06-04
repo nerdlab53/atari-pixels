@@ -262,7 +262,7 @@ def main():
 
     obs, info = env.reset(seed=config['seed'])
     state_stack = obs # obs from AtariEnv with FrameStack is already (num_stack, H, W)
-    replay_buffer = agent.replay_buffer if exploration_mode == 'epsilon' else shared_replay_buffer
+    replay_buffer = agent.replay_buffer # Always use the agent's configured replay buffer
     for step in range(max(5000, config['min_buffer'])):
         action = np.random.randint(0, config['n_actions'])
         next_obs, reward, terminated, truncated, info = env.step(action)
