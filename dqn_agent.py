@@ -215,7 +215,7 @@ class DQNCNN(nn.Module):
         # Standard DQN Fully Connected Stream
         self.fc_stream = nn.Sequential(
             nn.Linear(linear_input_size, 512),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(512, n_actions)
         )
         
