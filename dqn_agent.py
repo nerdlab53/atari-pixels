@@ -16,7 +16,6 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import random
-import math # For NoisyLinear
 
 class ReplayBuffer:
     """Experience replay buffer for DQN with support for intrinsic and extrinsic rewards."""
@@ -187,13 +186,13 @@ class PrioritizedReplayBuffer:
         return len(self.tree)
 
 class DQNCNN(nn.Module):
-    """CNN architecture for DQN, using Noisy Layers for the FC part.
+    """Standard CNN architecture for DQN.
     
     Architecture:
     1. Input: (batch_size, C_in, H, W) - e.g., (N, 8, 84, 84) stacked frames
     2. Conv layers process spatial features
     3. Flatten conv output
-    4. Fully connected layers (with NoisyLinear) compute Q-values for each action
+    4. Fully connected layers compute Q-values for each action
     """
     def __init__(self, input_shape, n_actions):
         super().__init__()
@@ -213,11 +212,11 @@ class DQNCNN(nn.Module):
         convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
         linear_input_size = convw * convh * 64
 
-        # Standard DQN Fully Connected Stream (using NoisyLinear)
+        # Standard DQN Fully Connected Stream
         self.fc_stream = nn.Sequential(
-            NoisyLinear(linear_input_size, 512),
+            nn.Linear(linear_input_size, 512),
             nn.ReLU(),
-            NoisyLinear(512, n_actions) # Outputs Q-values for each action
+            nn.Linear(512, n_actions)
         )
         
         self.apply(self._init_weights)
@@ -245,62 +244,6 @@ class DQNCNN(nn.Module):
         q_values = self.fc_stream(features)
         
         return q_values
-
-# --- NoisyLinear Layer --- #
-class NoisyLinear(nn.Module):
-    """Noisy Linear Layer for Noisy Network exploration.
-    Factorized Gaussian noise is used here.
-    """
-    def __init__(self, in_features, out_features, std_init=0.5):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.std_init = std_init
-
-        # Learnable parameters for the mean of the weights and biases
-        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
-        self.bias_mu = nn.Parameter(torch.empty(out_features))
-
-        # Learnable parameters for the standard deviation of the noise for weights and biases
-        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
-        self.bias_sigma = nn.Parameter(torch.empty(out_features))
-
-        # Non-learnable buffers for the noise (epsilon)
-        self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
-        self.register_buffer('bias_epsilon', torch.empty(out_features))
-
-        self.reset_parameters()
-        self.reset_noise()
-
-    def reset_parameters(self):
-        # Initialization similar to kaiming uniform but for NoisyNets
-        mu_range = 1 / math.sqrt(self.in_features)
-        self.weight_mu.data.uniform_(-mu_range, mu_range)
-        self.bias_mu.data.uniform_(-mu_range, mu_range)
-
-        self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
-        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features)) # Bias sigma init can differ
-
-    def _scale_noise(self, size):
-        # Factorized Gaussian noise: sign(x) * sqrt(|x|)
-        x = torch.randn(size, device=self.weight_mu.device)
-        return x.sign().mul_(x.abs().sqrt_())
-
-    def reset_noise(self):
-        epsilon_in = self._scale_noise(self.in_features)
-        epsilon_out = self._scale_noise(self.out_features)
-        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in)) # Outer product
-        self.bias_epsilon.copy_(epsilon_out) # Use same output noise for bias
-
-    def forward(self, x):
-        if not self.training: # For evaluation, use only the mean weights (no noise)
-            return nn.functional.linear(x, self.weight_mu, self.bias_mu)
-        
-        # During training, combine mean weights with noisy component
-        weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
-        bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
-        
-        return nn.functional.linear(x, weight, bias)
 
 class DQNAgent:
     """Deep Q-Network agent implementing several DQN improvements.
@@ -373,35 +316,28 @@ class DQNAgent:
         #     else:
         #         print("INFO: torch.compile skipped for policy_net (torch.compile not available).")
 
-    def select_action(self, state, mode: str = 'greedy', temperature: float = 1.0, epsilon: float = 0.0) -> int:
-        """Select action using the policy network.
-        With NoisyNets, exploration is implicit in the noisy weights during training.
-        Epsilon and temperature are no longer used for NoisyNets exploration.
-        The 'mode' parameter might be re-evaluated or simplified.
-        For training, policy_net should be in .train() mode to use noisy weights.
-        For evaluation, policy_net should be in .eval() mode to use mean weights.
-        """
-        state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
-        # self.policy_net.eval() # Old: for greedy/softmax without considering NoisyNet state
-        # For NoisyNets, the .train() or .eval() state of policy_net dictates noise.
-        # This should be set outside this function (e.g. before starting an episode or evaluation)
-        
-        with torch.no_grad(): # Q-value calculation should not affect gradients here
-            q_values = self.policy_net(state_tensor)
-            # Always act greedily on the (potentially noisy) Q-values
-            action = int(torch.argmax(q_values, dim=1).item())
-        return action
+    def select_action(self, state, epsilon: float = 0.0) -> int:
+        """Select action using epsilon-greedy policy."""
+        if random.random() < epsilon:
+            return random.randrange(self.n_actions)
+        else:
+            state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
+            self.policy_net.eval() # Set to evaluation mode for deterministic Q-values
+            with torch.no_grad():
+                q_values = self.policy_net(state_tensor)
+                action = int(torch.argmax(q_values, dim=1).item())
+            # self.policy_net.train() # Revert to train mode if optimize_model doesn't handle it
+            return action
 
     def optimize_model(self, mode: str = 'exploitation', alpha: float = 0.5):
         """Update policy network using double DQN algorithm with NaN protection."""
         if len(self.replay_buffer) < self.batch_size:
             return None
         
-        # Set policy_net to training mode (enables noise in NoisyLinear, and dropout/bn if any)
-        self.policy_net.train()
-        # Reset noise for NoisyLinear layers before processing a batch
-        if hasattr(self, 'reset_noise'): # Check if method exists (for compatibility if NoisyNets not used)
-            self.reset_noise()
+        self.policy_net.train() # Set policy_net to training mode
+        # Removed: NoisyNet specific logic
+        # if hasattr(self, 'reset_noise'): 
+        #     self.reset_noise()
             
         # Sample from replay buffer
         batch = self.replay_buffer.sample(self.batch_size, mode=mode, alpha=alpha)
@@ -636,14 +572,3 @@ class DQNAgent:
             'policy_grad_norm': policy_grad_norm,
             'target_grad_norm': target_grad_norm
         }
-
-    def reset_noise(self):
-        """Resets the noise in all NoisyLinear layers of the policy network."""
-        # Important: Only reset noise for the policy_net, as target_net should be stable
-        # and typically uses the mean weights if it were also noisy (though usually not needed for target).
-        # If policy_net is compiled, self.policy_net might be the compiled wrapper.
-        # We need to access the original module if it exists.
-        net_to_reset = self.policy_net._orig_mod if hasattr(self.policy_net, '_orig_mod') else self.policy_net
-        for module in net_to_reset.modules():
-            if isinstance(module, NoisyLinear):
-                module.reset_noise()

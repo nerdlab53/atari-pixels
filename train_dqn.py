@@ -15,6 +15,7 @@ import csv
 import time
 import wandb
 from collections import deque
+import math
 
 # Config
 config = {
@@ -33,6 +34,9 @@ config = {
     'per_alpha': 0.6,  # Alpha for Prioritized Experience Replay
     'per_beta_start': 0.4,  # Initial beta for PER
     'per_beta_frames': 1000000,  # Frames over which to anneal beta for PER
+    'epsilon_start': 1.0,
+    'epsilon_final': 0.1, # Standard final epsilon for Atari
+    'epsilon_decay_steps': 1000000 # Decay over 1M steps
 }
 
 # Set seeds and deterministic flags
@@ -207,8 +211,7 @@ def main():
     wandb.init(project="atari-drl-experiments", config=config, name=f"DQN_{run_name_suffix}_{time.strftime('%Y%m%d_%H%M%S')}")
 
     # --- Agent Initialization --- 
-    # Exploration mode is now implicitly handled by DQNAgent (NoisyNets or RND logic if RND mode was re-enabled)
-    # For now, assuming this script focuses on the NoisyNet-enhanced DQNAgent
+    # Agent is now a standard DQN agent, exploration handled by epsilon-greedy
     
     agent_params = {
         'n_actions': config['n_actions'],
@@ -226,11 +229,13 @@ def main():
     
     # Main agent for NoisyNets or standard epsilon-greedy (if DQNAgent handles it internally based on some flag)
     # Given our DQNAgent changes, it's now a NoisyNet Dueling DQN agent.
+    # Updated Comment: Agent is now a standard DQN.
     agent = DQNAgent(**agent_params)
 
     # RND specific setup - this part would need DQNAgent to be flexible or use a different agent class
     # For simplicity with NoisyNets, we'll assume the RND exploration mode is not being used here.
     # If RND is desired with NoisyNets, DQNAgent or RND class would need adaptation.
+    # Updated Comment: RND setup is not active with the current standard DQN focus.
     exploration_agent = None
     exploitation_agent = None
     shared_replay_buffer = None
@@ -245,6 +250,13 @@ def main():
 
     # Epsilon is no longer used with NoisyNets
     # epsilon = max(epsilon_final, epsilon_start - (epsilon_start - epsilon_final) * min(1.0, total_steps / epsilon_decay_steps))
+    # Reinstated Epsilon calculation logic
+    epsilon_by_frame = lambda frame_idx: config['epsilon_final'] + \
+                       (config['epsilon_start'] - config['epsilon_final']) * \
+                       math.exp(-1. * frame_idx / config['epsilon_decay_steps'])
+    # A simpler linear decay can also be used:
+    # epsilon = max(config['epsilon_final'], config['epsilon_start'] - total_steps / config['epsilon_decay_steps'])
+
     current_beta = config['per_beta_start'] if args.use_per else None # Initialize for logging
 
     # Fill replay buffer with random actions first (still useful)
@@ -306,37 +318,70 @@ def main():
         total_extrinsic_reward = 0
         done = False
         # Ensure agent is in training mode for the episode (for NoisyNets exploration)
-        agent.policy_net.train()
+        # agent.policy_net.train() # No longer needed here, managed by optimize_model and select_action
 
         # This outer if/else for exploration_mode can be simplified if we only use one agent type
         # For NoisyNet Dueling DQN as the primary agent:
+        # Updated Comment: Using standard DQN with epsilon-greedy
         for step in range(config['max_steps']):
-            action = agent.select_action(state_stack) # Epsilon no longer needed
+            epsilon = epsilon_by_frame(total_steps) # Calculate current epsilon
+            action = agent.select_action(state_stack, epsilon=epsilon) # Pass epsilon
             next_obs, extrinsic_reward, terminated, truncated, info = env.step(action)
             next_state_stack = np.array(next_obs) 
-            avg_loss = np.mean(losses) if losses else 0.0
-            exploitation_rewards_log.append(total_extrinsic_reward) # Assuming explore_r = exploit_r for NoisyNets
-            # running_avg = np.mean(exploration_rewards_log[-min(window_size_for_logs, len(exploration_rewards_log)):]) # If RND was used
-            running_avg = np.mean(exploitation_rewards_log[-min(window_size_for_logs, len(exploitation_rewards_log)):])
-            running_avg_rewards.append(running_avg)
-            running_losses.append(avg_loss)
-            running_rewards.append(total_extrinsic_reward) # Log extrinsic reward
-            avg_td_error = np.mean(td_errors) if td_errors else 0.0
-            running_td_errors.append(avg_td_error)
-            pbar.set_postfix({
-                'reward': total_extrinsic_reward, # Simplified name
-                # 'epsilon': f"{epsilon:.3f}", # Removed
-                'loss': f"{avg_loss:.3f}",
-                'td_error': f"{avg_td_error:.3f}"
-            })
-            if episode > 0 and episode % 10 == 0:
-                # last_10_explore = exploration_rewards_log[-10:] # If RND
-                last_10_exploit = exploitation_rewards_log[-10:]
-                print(f"[Stats] Episodes {episode-9}-{episode} | Avg Reward: {np.mean(last_10_exploit):.2f} | {policy_str}")
+            
+            # Store transition
+            # Intrinsic reward is 0.0 as RND is not active here
+            agent.replay_buffer.push(state_stack, action, extrinsic_reward, 0.0, next_state_stack, terminated or truncated)
+            
+            state_stack = next_state_stack
+            total_extrinsic_reward += extrinsic_reward
+            total_steps += 1 # Increment total_steps
+            
+            # Optimize model
+            optimize_result = agent.optimize_model() # Using 'exploitation' mode by default as RND is off
+            if optimize_result:
+                loss_val, td_error_val = optimize_result
+                losses.append(loss_val)
+                td_errors.append(td_error_val)
+            
+            # Update target network
+            if total_steps % config['target_update_freq'] == 0:
+                agent.update_target_network()
+            
+            # Anneal PER beta
+            if args.use_per:
+                fraction = min(1.0, total_steps / config['per_beta_frames'])
+                current_beta = config['per_beta_start'] + fraction * (1.0 - config['per_beta_start'])
+                agent.anneal_per_beta(current_beta)
 
-        # --- RND mode logic would go here, but we are focusing on the main NoisyNet agent ---
-        # else: # RND mode (original logic) - This block would need separate agent handling
-            # ... (original RND logic) ...
+            if not args.no_save:
+                frames.append(obs[-1]) # Store last frame of the current stack
+                actions.append(action)
+                extrinsic_rewards.append(extrinsic_reward) # Log extrinsic reward
+
+            if terminated or truncated:
+                break
+        
+        # Log episode results (moved out of the inner loop)
+        avg_loss = np.mean(losses) if losses else 0.0
+        exploitation_rewards_log.append(total_extrinsic_reward) 
+        running_avg = np.mean(exploitation_rewards_log[-min(window_size_for_logs, len(exploitation_rewards_log)):])
+        running_avg_rewards.append(running_avg)
+        running_losses.append(avg_loss)
+        running_rewards.append(total_extrinsic_reward) 
+        avg_td_error = np.mean(td_errors) if td_errors else 0.0
+        running_td_errors.append(avg_td_error)
+        
+        pbar.set_postfix({
+            'reward': total_extrinsic_reward, 
+            'epsilon': f"{epsilon:.3f}", # Added epsilon display
+            'loss': f"{avg_loss:.3f}",
+            'td_error': f"{avg_td_error:.3f}",
+            'beta': f"{current_beta:.3f}" if args.use_per else "N/A"
+        })
+        if episode > 0 and episode % 10 == 0:
+            last_10_exploit = exploitation_rewards_log[-10:]
+            print(f"[Stats] Episodes {episode-9}-{episode} | Avg Reward: {np.mean(last_10_exploit):.2f} | {policy_str}")
 
         if log_into_wandb:
             # Log to wandb
@@ -368,6 +413,7 @@ def main():
                     'train/running_loss': np.mean(running_losses) if running_losses else 0,
                     'train/running_td_error': np.mean(running_td_errors) if running_td_errors else 0,
                     'train/per_beta': current_beta if args.use_per else None,
+                    'train/epsilon': epsilon, # Log epsilon
                     'train/episode': episode,
                     'policy/weight_norm': weight_norms['policy_weight_norm'],
                     'policy/grad_norm': grad_norms['policy_grad_norm'],
@@ -397,6 +443,7 @@ def main():
     
     # Save the final model based on exploration mode
     final_agent_to_save = agent # Main agent is now the NoisyNet Dueling DQN agent
+    # Updated comment: Main agent is the standard DQN agent.
 
     if final_agent_to_save is not None:
         torch.save(final_agent_to_save.policy_net.state_dict(), final_checkpoint_path)
