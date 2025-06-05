@@ -286,8 +286,6 @@ def main():
         epoch_perplexity = 0
         epoch_codebook_loss = 0
         epoch_commitment_loss = 0
-        epoch_aux_debug_loss = 0
-        epoch_entropy_reg_term = 0.0
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs}", leave=False)
         for batch_idx, (frame_t, frame_tp1) in enumerate(progress_bar):
@@ -297,8 +295,7 @@ def main():
             
             reconstructed_frame_tp1, vq_loss_total, codebook_loss, scaled_commitment_loss, perplexity, latents_e, min_encoding_indices, quantized_for_decoder = model(frame_t, frame_tp1)
             
-            # --- START: Simplified Loss Calculation ---
-            total_loss, reconstruction_loss, *_ = model.calculate_loss(
+            total_loss, reconstruction_loss, _, _, _, _, _ = model.calculate_loss(
                 frame_tp1_original=frame_tp1, 
                 reconstructed_frame_tp1=reconstructed_frame_tp1, 
                 vq_loss_total_from_quantizer=vq_loss_total,
@@ -309,7 +306,6 @@ def main():
                 debug_embedding_weight=None,
                 use_aux_debug_loss=False
             )
-            # --- END: Simplified Loss Calculation ---
             
             total_loss.backward()
 
@@ -328,10 +324,6 @@ def main():
             epoch_codebook_loss += codebook_loss.item() # Log individual component
             epoch_commitment_loss += scaled_commitment_loss.item() # Log individual component
             epoch_perplexity += perplexity.item()
-            if aux_debug_loss_val is not None:
-                epoch_aux_debug_loss += aux_debug_loss_val.item()
-            if entropy_reg_val is not None:
-                epoch_entropy_reg_term += entropy_reg_val.item()
 
             if not args.disable_wandb: 
                 log_dict = {
@@ -357,10 +349,8 @@ def main():
         avg_codebook_loss = epoch_codebook_loss / len(train_loader)
         avg_commitment_loss = epoch_commitment_loss / len(train_loader)
         avg_perplexity = epoch_perplexity / len(train_loader)
-        avg_aux_debug_loss = epoch_aux_debug_loss / len(train_loader) if args.use_aux_debug_loss and epoch_aux_debug_loss > 0 else 0
-        avg_entropy_reg_term = epoch_entropy_reg_term / len(train_loader) if args.codebook_entropy_reg_weight > 0.0 else 0
 
-        my_logger_instance.info(f"Epoch {epoch}: Avg Train Loss: {avg_total_loss:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}, Avg VQ Loss: {avg_vq_loss:.4f}, Avg Perplexity: {avg_perplexity:.2f}, Avg Entropy Term: {avg_entropy_reg_term:.4f}")
+        my_logger_instance.info(f"Epoch {epoch}: Avg Train Loss: {avg_total_loss:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}, Avg VQ Loss: {avg_vq_loss:.4f}, Avg Perplexity: {avg_perplexity:.2f}")
 
         # --- START: Validation Loop ---
         model.eval()
@@ -374,8 +364,7 @@ def main():
 
                 reconstructed_frame_tp1, vq_loss_total, _, _, perplexity, _, min_encoding_indices, _ = model(frame_t, frame_tp1)
                 
-                # --- START: Simplified Loss Calculation for Validation ---
-                total_loss, reconstruction_loss, *_ = model.calculate_loss(
+                total_loss, reconstruction_loss, _, _, _, _, _ = model.calculate_loss(
                     frame_tp1_original=frame_tp1, 
                     reconstructed_frame_tp1=reconstructed_frame_tp1, 
                     vq_loss_total_from_quantizer=vq_loss_total,
@@ -386,7 +375,6 @@ def main():
                     debug_embedding_weight=None,
                     use_aux_debug_loss=False
                 )
-                # --- END: Simplified Loss Calculation for Validation ---
                 val_loss += total_loss.item()
                 val_recon_loss += reconstruction_loss.item()
                 val_vq_loss += vq_loss_total.item()
@@ -415,10 +403,6 @@ def main():
                 "epoch": epoch,
                 "learning_rate": scheduler.get_last_lr()[0] # Log current LR
             }
-            if args.use_aux_debug_loss:
-                epoch_log_dict["train/epoch_aux_debug_loss"] = avg_aux_debug_loss
-            if args.codebook_entropy_reg_weight > 0.0:
-                epoch_log_dict["train/epoch_entropy_reg_term"] = avg_entropy_reg_term
             
             # Add validation metrics to W&B log
             epoch_log_dict.update({
