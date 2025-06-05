@@ -46,14 +46,13 @@ def main():
     # Setup device, logging, and W&B
     device = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training") 
     
-    # --- TEMPORARILY DISABLING ALL WANDB --- 
-    # if not args.disable_wandb:
-    #     run_name = args.wandb_run_name if args.wandb_run_name else "VQ-VAE-Ms.Pac-Man Training"
-    #     wandb.init(project=args.wandb_project, name=run_name, config=args)
-    #     # Temporarily commenting out wandb.watch to isolate the AttributeError
-    #     # wandb.watch(model, log="parameters", log_graph=False, log_freq=100)
-    #     pass # Placeholder
-    # --- END TEMPORARILY DISABLING ALL WANDB ---
+    # --- RE-ENABLING MOST WANDB FUNCTIONALITY (EXCEPT WATCH) --- 
+    if not args.disable_wandb:
+        run_name = args.wandb_run_name if args.wandb_run_name else "VQ-VAE-Ms.Pac-Man Training"
+        wandb.init(project=args.wandb_project, name=run_name, config=args)
+        # wandb.watch() REMAINS COMMENTED OUT FOR NOW
+        pass 
+    # --- END WANDB RE-ENABLE --- 
 
     print(f"VQ-VAE Training Configuration:")
     for arg, value in vars(args).items():
@@ -101,8 +100,7 @@ def main():
     except Exception as e:
         print(f"Warning: Failed to compile model with torch.compile(): {e}. Proceeding without compilation.")
 
-    # if not args.disable_wandb:  # Related to wandb.watch, also disable if init is disabled
-    #     pass # wandb.watch was here
+    # wandb.watch() remains commented out
     print("Model initialized.")
     print(f"Model parameter count: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -148,15 +146,15 @@ def main():
             epoch_vq_loss += vq_loss.item() # vq_loss is a component of total_loss, but good to track separately
             epoch_perplexity += perplexity.item()
 
-            # if not args.disable_wandb: # Disable W&B logging inside the loop
-            #     wandb.log({
-            #         "train/batch_total_loss": total_loss.item(),
-            #         "train/batch_recon_loss": recon_loss.item(),
-            #         "train/batch_vq_loss": vq_loss.item(),
-            #         "train/batch_perplexity": perplexity.item(),
-            #         "epoch": epoch,
-            #         "batch_idx": batch_idx
-            #     })
+            if not args.disable_wandb: # Re-enable W&B logging inside the loop
+                wandb.log({
+                    "train/batch_total_loss": total_loss.item(),
+                    "train/batch_recon_loss": recon_loss.item(),
+                    "train/batch_vq_loss": vq_loss.item(),
+                    "train/batch_perplexity": perplexity.item(),
+                    "epoch": epoch,
+                    "batch_idx": batch_idx
+                })
             progress_bar.set_postfix({
                 "Total Loss": f"{total_loss.item():.4f}",
                 "Recon Loss": f"{recon_loss.item():.4f}",
@@ -171,28 +169,28 @@ def main():
 
         print(f"Epoch {epoch}: Avg Total Loss: {avg_total_loss:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}, Avg VQ Loss: {avg_vq_loss:.4f}, Avg Perplexity: {avg_perplexity:.2f}")
 
-        # if not args.disable_wandb: # Disable W&B logging for epoch summaries
-        #     wandb.log({
-        #         "train/epoch_total_loss": avg_total_loss,
-        #         "train/epoch_recon_loss": avg_recon_loss,
-        #         "train/epoch_vq_loss": avg_vq_loss,
-        #         "train/epoch_perplexity": avg_perplexity,
-        #         "epoch": epoch
-        #     })
+        if not args.disable_wandb: # Re-enable W&B logging for epoch summaries
+            wandb.log({
+                "train/epoch_total_loss": avg_total_loss,
+                "train/epoch_recon_loss": avg_recon_loss,
+                "train/epoch_vq_loss": avg_vq_loss,
+                "train/epoch_perplexity": avg_perplexity,
+                "epoch": epoch
+            })
             
-        #     # Log some reconstructed images
-        #     if batch_idx == 0 and epoch % args.save_interval == 0: # Log from first batch of epoch
-        #         if frame_t.shape[0] >= 4 and reconstructed_frame_tp1.shape[0] >=4: # Ensure enough images
-        #             wandb.log({
-        #                 "train/epoch_reconstructions": [
-        #                     wandb.Image(frame_t[i].cpu(), caption=f"frame_t_{i}") for i in range(4)
-        #                 ] + [
-        #                     wandb.Image(frame_tp1[i].cpu(), caption=f"frame_tp1_original_{i}") for i in range(4)
-        #                 ] + [
-        #                     wandb.Image(reconstructed_frame_tp1[i].cpu(), caption=f"frame_tp1_reconstructed_{i}") for i in range(4)
-        #                 ],
-        #                 "epoch": epoch
-        #             })
+            # Log some reconstructed images
+            if batch_idx == 0 and epoch % args.save_interval == 0: # Log from first batch of epoch
+                if frame_t.shape[0] >= 4 and reconstructed_frame_tp1.shape[0] >=4: # Ensure enough images
+                    wandb.log({
+                        "train/epoch_reconstructions": [
+                            wandb.Image(frame_t[i].cpu(), caption=f"frame_t_{i}") for i in range(4)
+                        ] + [
+                            wandb.Image(frame_tp1[i].cpu(), caption=f"frame_tp1_original_{i}") for i in range(4)
+                        ] + [
+                            wandb.Image(reconstructed_frame_tp1[i].cpu(), caption=f"frame_tp1_reconstructed_{i}") for i in range(4)
+                        ],
+                        "epoch": epoch
+                    })
 
 
         # Save checkpoint
@@ -206,11 +204,11 @@ def main():
                 'loss': avg_total_loss,
             }, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
-            # if not args.disable_wandb: # Disable W&B artifact saving
-            #     wandb.save(checkpoint_path) # Save to W&B artifacts
+            if not args.disable_wandb: # Re-enable W&B artifact saving
+                wandb.save(checkpoint_path) # Save to W&B artifacts
 
-    # if not args.disable_wandb: # Disable final W&B call
-    #     wandb.finish()
+    if not args.disable_wandb: # Re-enable final W&B call
+        wandb.finish()
     print("Training finished.")
 
 if __name__ == "__main__":
