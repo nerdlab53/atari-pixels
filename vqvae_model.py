@@ -410,7 +410,7 @@ class VQVAE(nn.Module):
                        min_encoding_indices: torch.Tensor | None = None, 
                        debug_embedding_weight: torch.Tensor | None = None, 
                        use_aux_debug_loss: bool = False
-                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """
         Calculates the total loss for the VQ-VAE.
 
@@ -434,33 +434,27 @@ class VQVAE(nn.Module):
             codebook_loss_from_quantizer (Tensor): The unscaled codebook loss (passed through).
             scaled_commitment_loss_from_quantizer (Tensor): The scaled commitment loss (passed through).
             aux_debug_loss_value (Tensor | None): The value of the auxiliary debug loss if used, else None.
+            entropy_reg_term_value (Tensor | None): The value of (codebook_entropy_reg_weight * entropy) if used, else None.
         """
         reconstruction_loss = F.mse_loss(reconstructed_frame_tp1, frame_tp1_original)
         
-        # The vq_loss_total_from_quantizer already includes codebook and scaled commitment loss
         total_loss = reconstruction_loss + vq_loss_total_from_quantizer
 
-        # --- START: MODIFICATION FOR CODEBOOK ENTROPY REGULARIZATION ---
+        entropy_reg_term_value = None # Initialize
         if codebook_entropy_reg_weight > 0.0:
             if min_encoding_indices is None:
                 raise ValueError("min_encoding_indices must be provided for codebook entropy regularization.")
-            # Calculate codebook entropy. min_encoding_indices is (B, H_latent*W_latent)
-            # Count occurrences of each code index
-            # Ensure indices are within the valid range [0, num_embeddings-1]
             num_embeddings = self.quantizer.num_embeddings
             counts = torch.zeros(num_embeddings, device=min_encoding_indices.device)
-            # Unique counts for each index
             unique_indices, counts_for_unique = torch.unique(min_encoding_indices, return_counts=True)
             counts.scatter_add_(0, unique_indices, counts_for_unique.float())
 
-            # Normalize to get probabilities
             probs = counts / counts.sum()
-            # Calculate entropy: -sum(p * log(p))
-            # Add a small epsilon to prevent log(0)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-10))
-            # We want to maximize entropy, so we subtract it from the loss
-            total_loss -= codebook_entropy_reg_weight * entropy
-        # --- END: MODIFICATION FOR CODEBOOK ENTROPY REGULARIZATION ---
+            entropy_val = -torch.sum(probs * torch.log(probs + 1e-10))
+            
+            current_entropy_reg_term = codebook_entropy_reg_weight * entropy_val
+            total_loss -= current_entropy_reg_term
+            entropy_reg_term_value = current_entropy_reg_term.detach() # Detach for logging
 
         # Auxiliary debug loss (remains for now)
         aux_debug_loss_value = None
@@ -483,7 +477,7 @@ class VQVAE(nn.Module):
             total_loss += aux_debug_loss
             aux_debug_loss_value = aux_debug_loss.detach() # Detach for logging
 
-        return total_loss, reconstruction_loss, vq_loss_total_from_quantizer, codebook_loss_from_quantizer, scaled_commitment_loss_from_quantizer, aux_debug_loss_value
+        return total_loss, reconstruction_loss, vq_loss_total_from_quantizer, codebook_loss_from_quantizer, scaled_commitment_loss_from_quantizer, aux_debug_loss_value, entropy_reg_term_value
 
 # Next: VQVAE main model
 
