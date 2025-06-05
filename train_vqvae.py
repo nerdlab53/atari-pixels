@@ -156,9 +156,10 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
-    first_batch_checked_gradients = False # Flag to ensure check_gradients runs only once
+    first_batch_checked_gradients = False 
 
     print("\nStarting training...")
+    global_step = 0  # Initialize global step counter
     for epoch in range(1, args.num_epochs + 1):
         model.train()
         epoch_total_loss = 0
@@ -199,6 +200,7 @@ def main():
             # --- END: Call check_gradients ---
 
             optimizer.step()
+            global_step += 1 # Increment global step
             
             epoch_total_loss += total_loss.item()
             epoch_recon_loss += reconstruction_loss.item()
@@ -209,8 +211,8 @@ def main():
             if aux_debug_loss_val is not None:
                 epoch_aux_debug_loss += aux_debug_loss_val.item()
 
-            if not args.disable_wandb: # Re-enable W&B logging inside the loop
-                wandb.log({
+            if not args.disable_wandb: 
+                log_dict = {
                     "train/batch_total_loss": total_loss.item(),
                     "train/batch_reconstruction_loss": reconstruction_loss.item(),
                     "train/batch_vq_loss_total": vq_loss_total.item(),
@@ -218,7 +220,10 @@ def main():
                     "train/batch_commitment_loss_scaled": scaled_commitment_loss.item(),
                     "train/batch_perplexity": perplexity.item(),
                     "train/learning_rate": optimizer.param_groups[0]['lr']
-                }, step=batch_idx)
+                }
+                if args.use_aux_debug_loss and aux_debug_loss_val is not None:
+                    log_dict["train/batch_aux_debug_loss"] = aux_debug_loss_val.item()
+                wandb.log(log_dict, step=global_step) # Use global_step for batch logging
             progress_bar.set_postfix({
                 "Total Loss": f"{total_loss.item():.4f}",
                 "Recon Loss": f"{reconstruction_loss.item():.4f}",
@@ -234,32 +239,42 @@ def main():
         avg_perplexity = epoch_perplexity / len(train_loader)
         avg_aux_debug_loss = epoch_aux_debug_loss / len(train_loader) if args.use_aux_debug_loss else 0
 
-        print(f"Epoch {epoch}: Avg Total Loss: {avg_total_loss:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}, Avg VQ Loss: {avg_vq_loss:.4f}, Avg Perplexity: {avg_perplexity:.2f}")
+        my_logger_instance.info(f"Epoch {epoch}: Avg Total Loss: {avg_total_loss:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}, Avg VQ Loss: {avg_vq_loss:.4f}, Avg Perplexity: {avg_perplexity:.2f}")
 
-        if not args.disable_wandb: # Re-enable W&B logging for epoch summaries
-            wandb.log({
+        if not args.disable_wandb: 
+            epoch_log_dict = {
                 "train/epoch_total_loss": avg_total_loss,
                 "train/epoch_reconstruction_loss": avg_recon_loss,
                 "train/epoch_vq_loss_total": avg_vq_loss,
-                "train/epoch_codebook_loss": avg_codebook_loss,
-                "train/epoch_commitment_loss_scaled": avg_commitment_loss,
+                "train/epoch_codebook_loss": avg_codebook_loss, 
+                "train/epoch_commitment_loss_scaled": avg_commitment_loss, 
                 "train/epoch_perplexity": avg_perplexity,
-                "epoch": epoch
-            }, step=epoch)
+                "epoch": epoch # Keep this for clarity or direct epoch reference
+            }
+            if args.use_aux_debug_loss:
+                epoch_log_dict["train/epoch_aux_debug_loss"] = avg_aux_debug_loss
+            # For epoch-level logs, using the epoch number itself as the step is fine and common.
+            # Alternatively, could use global_step here as well for a single consistent x-axis for all plots.
+            # Let's keep it as epoch for now for clear epoch-wise summaries.
+            wandb.log(epoch_log_dict, step=epoch) 
             
             # Log some reconstructed images
-            if batch_idx == 0 and epoch % args.save_interval == 0: # Log from first batch of epoch
-                if frame_t.shape[0] >= 4 and reconstructed_frame_tp1.shape[0] >=4: # Ensure enough images
+            # Ensure batch_idx is from the current epoch's train_loader to avoid issues if train_loader is empty
+            # The check should be on whether train_loader produced any batches.
+            if len(train_loader) > 0 and epoch % args.save_interval == 0: 
+                # To get first batch images, we might need to re-fetch or store them.
+                # For simplicity, let's log the last batch's images if available from the loop.
+                # This assumes frame_t and reconstructed_frame_tp1 are from the last batch of the epoch.
+                if frame_t.shape[0] >= 4 and reconstructed_frame_tp1.shape[0] >=4: 
                     wandb.log({
                         "train/epoch_reconstructions": [
-                            wandb.Image(frame_t[i].cpu(), caption=f"frame_t_{i}") for i in range(4)
+                            wandb.Image(frame_t[i].cpu(), caption=f"frame_t_{i}_epoch{epoch}") for i in range(4)
                         ] + [
-                            wandb.Image(frame_tp1[i].cpu(), caption=f"frame_tp1_original_{i}") for i in range(4)
+                            wandb.Image(frame_tp1[i].cpu(), caption=f"frame_tp1_original_{i}_epoch{epoch}") for i in range(4)
                         ] + [
-                            wandb.Image(reconstructed_frame_tp1[i].cpu(), caption=f"frame_tp1_reconstructed_{i}") for i in range(4)
+                            wandb.Image(reconstructed_frame_tp1[i].cpu(), caption=f"frame_tp1_reconstructed_{i}_epoch{epoch}") for i in range(4)
                         ],
-                        "epoch": epoch
-                    })
+                    }, step=epoch) # Log images with epoch step
 
 
         # Save checkpoint
