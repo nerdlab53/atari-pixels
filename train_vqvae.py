@@ -65,9 +65,10 @@ def main():
     args = parse_args()
 
     # Setup device, logging, and W&B
-    device = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training") 
+    device, my_logger_instance = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training") 
+    message_to_log = f"Using device: {device}"
+    my_logger_instance.info(message_to_log) 
     
-    logger.info(f"Using device: {device}")
     wandb_run = None
     if not args.disable_wandb:
         if args.wandb_run_id:
@@ -77,19 +78,19 @@ def main():
             run_id = wandb.util.generate_id()
             run_name = f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        logger.info(f"Initializing W&B run with name: {run_name} and ID: {run_id}")
+        my_logger_instance.info(f"Initializing W&B run with name: {run_name} and ID: {run_id}")
         
         config_to_log = vars(args).copy()
-        config_to_log['actual_device'] = device.type # Add the actual device type
+        config_to_log['actual_device'] = device.type
 
         wandb_run = wandb.init(
             project=args.wandb_project, 
             name=run_name, 
             id=run_id, 
-            config=config_to_log, # Log updated config
+            config=config_to_log, 
             resume="allow" if args.wandb_run_id else None
         )
-        logger.info(f"W&B run initialized. Run URL: {wandb_run.url if wandb_run else 'N/A'}")
+        my_logger_instance.info(f"W&B run initialized. Run URL: {wandb_run.url if wandb_run else 'N/A'}")
 
     print(f"VQ-VAE Training Configuration:")
     for arg, value in vars(args).items():
