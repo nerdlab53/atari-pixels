@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument("--codebook_entropy_warmup_epochs", type=int, default=0, help="Epochs to warm up codebook entropy regularization.")
     parser.add_argument("--use_aux_debug_loss", action="store_true", help="Use auxiliary debug loss.")
     parser.add_argument("--log_interval", type=int, default=10, help="Log interval for W&B.")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to a checkpoint to resume training from.")
 
     return parser.parse_args()
 
@@ -168,11 +169,43 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
+    # --- START: Logic for resuming from checkpoint ---
+    start_epoch = 1
+    global_step = 0
+    if args.resume_checkpoint:
+        my_logger_instance.info(f"Resuming training from checkpoint: {args.resume_checkpoint}")
+        try:
+            checkpoint = torch.load(args.resume_checkpoint, map_location=device)
+            
+            # Note: DDP models save with a 'module.' prefix. Our single-GPU model doesn't.
+            # Create a new state_dict without the prefix if it exists.
+            model_state_dict = checkpoint['model_state_dict']
+            new_state_dict = {key.replace('module.', ''): value for key, value in model_state_dict.items()}
+            
+            model.load_state_dict(new_state_dict)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            
+            # Important: Resume global_step if it was saved, otherwise estimate it.
+            # For simplicity, we can estimate. A more robust way is to save/load it.
+            # Let's assume len(train_loader) is available
+            # global_step = (start_epoch - 1) * len(train_loader) # This is an approximation
+            # For now, let's just warn the user if global_step isn't saved.
+            if 'global_step' in checkpoint:
+                global_step = checkpoint['global_step']
+                my_logger_instance.info(f"Resumed model, optimizer, and epoch {start_epoch}. Resuming global_step from {global_step}.")
+            else:
+                my_logger_instance.warning("global_step not found in checkpoint. W&B batch steps will restart from 0 for this run if not a resumed W&B run.")
+
+        except FileNotFoundError:
+            my_logger_instance.error(f"Checkpoint file not found: {args.resume_checkpoint}. Starting from scratch.")
+        except Exception as e:
+            my_logger_instance.error(f"Error loading checkpoint: {e}. Starting from scratch.")
+
     first_batch_checked_gradients = False 
 
     print("\nStarting training...")
-    global_step = 0  # Initialize global step counter
-    for epoch in range(1, args.num_epochs + 1):
+    for epoch in range(start_epoch, args.num_epochs + 1):
         model.train()
         epoch_total_loss = 0
         epoch_recon_loss = 0
@@ -207,7 +240,7 @@ def main():
             total_loss.backward()
 
             # --- START: Call check_gradients after first backward pass of first epoch ---
-            if not first_batch_checked_gradients and epoch == 1 and batch_idx == 0:
+            if not first_batch_checked_gradients and epoch == start_epoch and batch_idx == 0:
                 check_gradients(model, epoch, batch_idx)
                 first_batch_checked_gradients = True
             # --- END: Call check_gradients ---
@@ -295,26 +328,20 @@ def main():
 
         # Save checkpoint
         if epoch % args.save_interval == 0:
-            # Sanitize env_name for filename by replacing slashes
             safe_env_name = args.env_name.replace("/", "_")
             checkpoint_filename = f"{safe_env_name}_vqvae_epoch_{epoch}.pth"
             checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_filename)
             
-            # Ensure the immediate directory for the checkpoint exists (though checkpoint_dir itself is already created)
-            # For this simpler filename structure, os.makedirs(args.checkpoint_dir, exist_ok=True) is sufficient.
-            # If checkpoint_filename itself contained subdirectories, we would do:
-            # os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-            # But with the flattened name, this is not needed beyond the initial args.checkpoint_dir creation.
-
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'args': args,
                 'loss': avg_total_loss,
+                'global_step': global_step # Save global_step
             }, checkpoint_path)
-            print(f"Saved checkpoint: {checkpoint_path}")
-            if not args.disable_wandb: # Re-enable W&B artifact saving
+            my_logger_instance.info(f"Saved checkpoint: {checkpoint_path}")
+            if not args.disable_wandb:
                 wandb.save(checkpoint_path) # Save to W&B artifacts
 
     if not args.disable_wandb: # Re-enable final W&B call
