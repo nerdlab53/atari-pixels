@@ -15,7 +15,7 @@ from utils import setup_device_logging # Assuming a utils.py for device and logg
 def parse_args():
     parser = argparse.ArgumentParser(description="Train VQ-VAE model on Atari frame pairs.")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing the VQ-VAE training data (PNG frame pairs).")
-    parser.add_argument("--env_name", type=str, default="BreakoutNoFrameskip-v4", help="Name of the Atari environment data was generated from.")
+    parser.add_argument("--env_name", type=str, default="ALE/MsPacman-v5", help="Name of the Atari environment data was generated from (e.g., ALE/MsPacman-v5).")
     
     # Model hyperparameters
     parser.add_argument("--input_channels_per_frame", type=int, default=3, help="Number of channels per input frame (3 for RGB, 1 for grayscale).")
@@ -44,7 +44,7 @@ def main():
     args = parse_args()
 
     # Setup device, logging, and W&B
-    device = setup_device_logging(args.device, args.env_name, "VQVAE_Training") # Assuming setup_device_logging handles print/logging
+    device = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training") 
     if not args.disable_wandb:
         run_name = args.wandb_run_name if args.wandb_run_name else "VQ-VAE-Ms.Pac-Man Training"
         wandb.init(project=args.wandb_project, name=run_name, config=args)
