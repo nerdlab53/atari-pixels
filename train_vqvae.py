@@ -232,7 +232,7 @@ def main():
 
     # --- START: Add LR Scheduler ---
     # Decay LR by gamma every step_size epochs
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
     # --- END: Add LR Scheduler ---
 
     # --- START: Logic for resuming from checkpoint ---
@@ -447,23 +447,6 @@ def main():
                     })
 
         # Save checkpoint
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            epochs_no_improve = 0
-            checkpoint_path = os.path.join(args.checkpoint_dir, f"{args.env_name.replace('/', '_')}_best.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(), # Save scheduler state
-                'args': args,
-                'loss': best_val_loss,
-                'global_step': global_step
-            }, checkpoint_path)
-            my_logger_instance.info(f"New best model saved to {checkpoint_path}")
-            if not args.disable_wandb:
-                wandb.save(checkpoint_path) # Save to W&B artifacts
-
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             epochs_no_improve = 0
