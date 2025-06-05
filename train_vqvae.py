@@ -92,6 +92,30 @@ def main():
         )
         my_logger_instance.info(f"W&B run initialized. Run URL: {wandb_run.url if wandb_run else 'N/A'}")
 
+        # --- START: Define custom x-axes for W&B --- 
+        if wandb_run:
+            wandb.define_metric("train/batch_total_loss", step_metric="global_step")
+            wandb.define_metric("train/batch_reconstruction_loss", step_metric="global_step")
+            wandb.define_metric("train/batch_vq_loss_total", step_metric="global_step")
+            wandb.define_metric("train/batch_codebook_loss", step_metric="global_step")
+            wandb.define_metric("train/batch_commitment_loss_scaled", step_metric="global_step")
+            wandb.define_metric("train/batch_perplexity", step_metric="global_step")
+            wandb.define_metric("train/learning_rate", step_metric="global_step")
+            if args.use_aux_debug_loss:
+                 wandb.define_metric("train/batch_aux_debug_loss", step_metric="global_step")
+
+            wandb.define_metric("train/epoch_total_loss", step_metric="epoch")
+            wandb.define_metric("train/epoch_reconstruction_loss", step_metric="epoch")
+            wandb.define_metric("train/epoch_vq_loss_total", step_metric="epoch")
+            wandb.define_metric("train/epoch_codebook_loss", step_metric="epoch")
+            wandb.define_metric("train/epoch_commitment_loss_scaled", step_metric="epoch")
+            wandb.define_metric("train/epoch_perplexity", step_metric="epoch")
+            if args.use_aux_debug_loss:
+                wandb.define_metric("train/epoch_aux_debug_loss", step_metric="epoch")
+            wandb.define_metric("epoch", step_metric="epoch") # Define x-axis for the 'epoch' metric itself
+            wandb.define_metric("train/epoch_reconstructions", step_metric="epoch")
+        # --- END: Define custom x-axes for W&B --- 
+
     print(f"VQ-VAE Training Configuration:")
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
@@ -249,22 +273,14 @@ def main():
                 "train/epoch_codebook_loss": avg_codebook_loss, 
                 "train/epoch_commitment_loss_scaled": avg_commitment_loss, 
                 "train/epoch_perplexity": avg_perplexity,
-                "epoch": epoch # Keep this for clarity or direct epoch reference
+                "epoch": epoch # This logs the epoch number itself, its x-axis will be itself or default.
             }
             if args.use_aux_debug_loss:
                 epoch_log_dict["train/epoch_aux_debug_loss"] = avg_aux_debug_loss
-            # For epoch-level logs, using the epoch number itself as the step is fine and common.
-            # Alternatively, could use global_step here as well for a single consistent x-axis for all plots.
-            # Let's keep it as epoch for now for clear epoch-wise summaries.
+            
             wandb.log(epoch_log_dict, step=epoch) 
             
-            # Log some reconstructed images
-            # Ensure batch_idx is from the current epoch's train_loader to avoid issues if train_loader is empty
-            # The check should be on whether train_loader produced any batches.
             if len(train_loader) > 0 and epoch % args.save_interval == 0: 
-                # To get first batch images, we might need to re-fetch or store them.
-                # For simplicity, let's log the last batch's images if available from the loop.
-                # This assumes frame_t and reconstructed_frame_tp1 are from the last batch of the epoch.
                 if frame_t.shape[0] >= 4 and reconstructed_frame_tp1.shape[0] >=4: 
                     wandb.log({
                         "train/epoch_reconstructions": [
@@ -274,7 +290,7 @@ def main():
                         ] + [
                             wandb.Image(reconstructed_frame_tp1[i].cpu(), caption=f"frame_tp1_reconstructed_{i}_epoch{epoch}") for i in range(4)
                         ],
-                    }, step=epoch) # Log images with epoch step
+                    }, step=epoch) 
 
 
         # Save checkpoint
