@@ -268,66 +268,10 @@ class Decoder(nn.Module):
         # --- END: FiLM CONDITIONING MODIFICATION ---
 
         # Main decoder path using Transposed Convolutions
-        # Input to first TConv: (B, embedding_dim, 5, 7)
-        # Target channel progression: embedding_dim -> 512 -> 512 -> 256 -> 128 -> 64 -> output_channels
+        # Input to first TConv: (B, embedding_dim, H_latent, W_latent) (e.g. 7,5 for H,W)
+        # Target channel progression: embedding_dim -> 512 -> 256 -> 128 -> 64 -> output_channels
         
-        self.decoder_layers = nn.ModuleList([
-            # Layer 1: (B, embedding_dim, 5, 7) -> (B, 512, 10, 13) (Matches Encoder L4 output)
-            # H: (5-1)*2 - 2*1 + 3 + 1 = 8 - 2 + 3 + 1 = 10
-            # W: (7-1)*2 - 2*1 + 3 + 1 = 12 - 2 + 3 + 1 = 14. K=3,P=1,S=2 -> (7-1)*2 -2*1 + 3 +1 = 14.
-            # We need to map to (10,13), so padding might need adjustment or output_padding
-            # (H_in - 1)*S - 2P + K + OP = H_out
-            # H: (5-1)*2 - 2*1 + K_h + OP_h = 10 => 8 - 2 + K_h + OP_h = 10 => K_h + OP_h = 4
-            # W: (7-1)*2 - 2*1 + K_w + OP_w = 13 => 12 - 2 + K_w + OP_w = 13 => K_w + OP_w = 3
-            # Using K=4, S=2, P=1 (as in encoder) but for TConv:
-            # H_out = (H_in - 1)*S - 2*P + K = (5-1)*2 - 2*1 + 4 = 8-2+4 = 10.
-            # W_out = (W_in - 1)*S - 2*P + K = (7-1)*2 - 2*1 + 4 = 12-2+4 = 14. Close.
-            # Let's use K=4, S=2, P=1 for TConv. output_padding might be needed for exact W=13.
-            nn.ConvTranspose2d(embedding_dim, 512, kernel_size=4, stride=2, padding=1), # Output (10, 14)
-            # This layer will be FiLM conditioned.
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-
-            # Layer 2: (B, 512, 10, 14) -> (B, 256, 20, 27) (Matches Encoder L3 output, W needs adjustment)
-            # H: (10-1)*2 - 2*1 + 4 = 18-2+4 = 20.
-            # W: (14-1)*2 - 2*1 + 4 = 26-2+4 = 28.
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1), # Output (20, 28)
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            # This layer will be FiLM conditioned.
-
-            # Layer 3: (B, 256, 20, 28) -> (B, 128, 40, 53) (Matches Encoder L2 output, W needs adjustment)
-            # H: (20-1)*2 - 2*1 + 4 = 38-2+4 = 40.
-            # W: (28-1)*2 - 2*1 + 4 = 54-2+4 = 56.
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), # Output (40, 56)
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-
-            # Layer 4: (B, 128, 40, 56) -> (B, 64, 80, 105) (Matches Encoder L1 output, W needs adjustment)
-            # H: (40-1)*2 - 2*1 + 4 = 78-2+4 = 80.
-            # W: (56-1)*2 - 2*1 + 4 = 110-2+4 = 112.
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, output_padding=(0,1)), # (B, 64, 80, 111+1=112) no... -> (B, 64, 80, 105), need W=105 from 52. S=2 P=1 K=4: (52-1)*2 -2*1 + 4 = 102-2+4 = 104. Add op=1 for 105.
-            # For H_in=40, W_in=56. Want H_out=80, W_out=105.
-            # H: (40-1)*2 - 2*1 + 4 = 78-2+4 = 80.
-            # W: (56-1)*2 - 2*1 + 4 = 110-2+4 = 112. Need to get W_out=105.
-            # To get 105 from 56: (56-1)*S -2P + K +OP = 105. If S=2, K=4, P=1: 110-2+4 = 112. op_w = -7 (not possible)
-            # Let's adjust kernel for this layer for W. Target (80, 105) from (40, 56)
-            # H: (40-1)*2+0-2*0+K_h=80 => 78+K_h=80 => K_h=2. S=2,P=0,K=2. Or S=2,P=1,K=4.
-            # W: (56-1)*2+0-2*0+K_w=105 => 110+K_w=105 => K_w=-5. (Not possible with K=4,S=2,P=1)
-            # The encoder's layer 2 output was (40, 52). If decoder input is (40,52), output (80, 104 or 105)
-            # If K=4,S=2,P=1: W_out = (52-1)*2-2*1+4 = 102-2+4 = 104. Add output_padding=(0,1) to get 105.
-            # So, if layer 3 output (40,52), layer 4 TConv K=4,S=2,P=1,OP=(0,1) -> (80,105)
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-
-            # Layer 5: (B, 64, 80, 105) -> (B, output_channels, 160, 210)
-            # H: (80-1)*2 - 2*1 + 4 = 158-2+4 = 160.
-            # W: (105-1)*2 - 2*1 + 4 = 208-2+4 = 210.
-            nn.ConvTranspose2d(64, output_channels, kernel_size=4, stride=2, padding=1)
-            # Final layer, usually followed by a sigmoid to scale output to [0,1] or tanh to [-1,1]
-            # If dataset ensures [0,1] input, and MSE loss, sigmoid is appropriate.
-        ])
-        
+        # Corrected Transposed Conv Layers based on Encoder output sizes for symmetrical upsampling:
         # Latent_map (input to Decoder): (embedding_dim, 7, 5) (H_latent=7, W_latent=5)
         self.decoder_tconv_layers = nn.ModuleList([
             # Dec_L1: Input(emb_dim, 7, 5) -> Output(512, 13, 10)
