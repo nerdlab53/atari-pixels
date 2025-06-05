@@ -328,21 +328,18 @@ class Decoder(nn.Module):
             # If dataset ensures [0,1] input, and MSE loss, sigmoid is appropriate.
         ])
         
-        # Correcting Transposed Conv Layers based on Encoder output sizes for symmetrical upsampling:
-        # Encoder outputs: L1(80,105), L2(40,52), L3(20,26), L4(10,13), L5_before_1x1(5,7)
-        # Latent_map (input to Decoder): (embedding_dim, 5, 7)
+        # Latent_map (input to Decoder): (embedding_dim, 7, 5) (H_latent=7, W_latent=5)
         self.decoder_tconv_layers = nn.ModuleList([
-            # Dec_L1: Input(emb_dim, 5, 7) -> Output(512, 10, 13) [Matches Enc_L4]
-            nn.ConvTranspose2d(embedding_dim, 512, kernel_size=3, stride=2, padding=1, output_padding=(1,0)), # H:(5-1)*2-2*1+3+1=10, W:(7-1)*2-2*1+3+0=13
-            # Dec_L2: Input(512, 10, 13) -> Output(256, 20, 26) [Matches Enc_L3]
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1), # H:(10-1)*2-2*1+4=20, W:(13-1)*2-2*1+4=26
-            # Dec_L3: Input(256, 20, 26) -> Output(128, 40, 52) [Matches Enc_L2]
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), # H:(20-1)*2-2*1+4=40, W:(26-1)*2-2*1+4=52
-            # Dec_L4: Input(128, 40, 52) -> Output(64, 80, 105) [Matches Enc_L1]
-            # H:(40-1)*2-2*1+4=80. W:(52-1)*2-2*1+4=104. Need W_out=105. output_padding=(0,1)
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, output_padding=(0,1)),
-            # Dec_L5: Input(64, 80, 105) -> Output(output_channels, 160, 210)
-            nn.ConvTranspose2d(64, output_channels, kernel_size=4, stride=2, padding=1)
+            # Dec_L1: Input(emb_dim, 7, 5) -> Output(512, 13, 10)
+            nn.ConvTranspose2d(embedding_dim, 512, kernel_size=3, stride=2, padding=1, output_padding=(0,1)),
+            # Dec_L2: Input(512, 13, 10) -> Output(256, 26, 20)
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, output_padding=(0,0)),
+            # Dec_L3: Input(256, 26, 20) -> Output(128, 52, 40)
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, output_padding=(0,0)),
+            # Dec_L4: Input(128, 52, 40) -> Output(64, 105, 80)
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, output_padding=(1,0)),
+            # Dec_L5: Input(64, 105, 80) -> Output(output_channels, 210, 160)
+            nn.ConvTranspose2d(64, output_channels, kernel_size=4, stride=2, padding=1, output_padding=(0,0))
         ])
         
         self.decoder_bn_relu_blocks = nn.ModuleList([
