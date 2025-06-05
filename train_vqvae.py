@@ -61,11 +61,12 @@ def main():
     # Setup device, logging, and W&B
     device = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training") 
     
+    wandb_initialized = False
     if not args.disable_wandb:
         run_name = args.wandb_run_name if args.wandb_run_name else "VQ-VAE-Ms.Pac-Man Training"
         wandb.init(project=args.wandb_project, name=run_name, config=args)
-        # Using expert's recommended robust wandb.watch() call
-        wandb.watch(model, log="parameters", log_freq=100, log_graph=False) 
+        wandb_initialized = True
+        # wandb.watch() will be called AFTER model initialization
 
     print(f"VQ-VAE Training Configuration:")
     for arg, value in vars(args).items():
@@ -112,6 +113,15 @@ def main():
         print("Model compiled successfully.")
     except Exception as e:
         print(f"Warning: Failed to compile model with torch.compile(): {e}. Proceeding without compilation.")
+
+    if wandb_initialized:
+        # Call wandb.watch() AFTER model is initialized and compiled
+        print("Setting up wandb.watch()...")
+        try:
+            wandb.watch(model, log="parameters", log_freq=100, log_graph=False)
+            print("wandb.watch() setup successfully.")
+        except Exception as e:
+            print(f"Warning: wandb.watch() failed during setup: {e}. Proceeding without it.")
 
     print("Model initialized.")
     print(f"Model parameter count: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
