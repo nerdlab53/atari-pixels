@@ -52,7 +52,7 @@ from train_dqn import AtariEnv, config as default_config # AtariEnv is generic
 def record_gameplay(model_path, env_name, output_dir, num_episodes=5, seed=42):
     """
     Records gameplay of a trained non-LSTM DQN agent.
-
+    
     Args:
         model_path (str): Path to the trained .pth model file.
         env_name (str): Name of the Atari environment (e.g., 'ALE/MsPacman-v5').
@@ -64,8 +64,8 @@ def record_gameplay(model_path, env_name, output_dir, num_episodes=5, seed=42):
         print(f"Error: Model path not found: {model_path}")
         return
 
-    os.makedirs(output_dir, exist_ok=True)
-
+        os.makedirs(output_dir, exist_ok=True)
+    
     # --- Device Setup ---
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -176,7 +176,7 @@ if __name__ == '__main__':
     record_gameplay(
         model_path=args.model_path,
         env_name=args.env_name,
-        output_dir=args.output_dir,
-        num_episodes=args.num_episodes,
+            output_dir=args.output_dir,
+            num_episodes=args.num_episodes,
         seed=args.seed
-    )
+        )

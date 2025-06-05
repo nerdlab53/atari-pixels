@@ -4,10 +4,13 @@ import argparse
 import os
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import wandb
 from tqdm import tqdm
 from datetime import datetime
+import random
+import numpy as np
+import piq
 
 from vqvae_model import VQVAE
 from latent_action_data import AtariFramePairDataset # Using the existing dataset
@@ -20,22 +23,23 @@ def parse_args():
     
     # Model hyperparameters
     parser.add_argument("--input_channels_per_frame", type=int, default=3, help="Number of channels per input frame (3 for RGB, 1 for grayscale).")
-    parser.add_argument("--embedding_dim", type=int, default=256, help="Dimensionality of the latent embeddings in VQ layer.")
-    parser.add_argument("--num_embeddings", type=int, default=512, help="Number of codebook vectors in VQ layer (K).")
+    parser.add_argument("--embedding_dim", type=int, default=64, help="Dimensionality of the latent embeddings. Reduced to 64 for smaller datasets to prevent overfitting.")
+    parser.add_argument("--num_embeddings", type=int, default=256, help="Number of codebook vectors in VQ layer (K).")
     parser.add_argument("--commitment_cost", type=float, default=0.25, help="Commitment cost for VQ-VAE loss (beta).")
-    parser.add_argument("--codebook_entropy_reg_weight", type=float, default=0.0, help="Weight for codebook entropy regularization (gamma). Set to 0 to disable.")
+    parser.add_argument("--dropout_p", type=float, default=0.1, help="Dropout probability for Encoder/Decoder.")
 
     # Training hyperparameters
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer.")
-    parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay for the optimizer.")
+    parser.add_argument("--num_epochs", type=int, default=200, help="Number of training epochs.")
     parser.add_argument("--device", type=str, default=None, help="Device to use ('cuda', 'mps', 'cpu'). Autodetected if None.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for DataLoader.")
     parser.add_argument("--save_interval", type=int, default=10, help="Save model checkpoint every N epochs.")
     parser.add_argument("--checkpoint_dir", type=str, default="vqvae_checkpoints", help="Directory to save model checkpoints.")
     
     # W&B
-    parser.add_argument("--wandb_project", type=str, default="atari-vqvae", help="Weights & Biases project name.")
+    parser.add_argument("--wandb_project", type=str, default="atari-vqvae-refactored", help="Weights & Biases project name.")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name. Defaults to env_name-vqvae-timestamp.")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging.")
     parser.add_argument("--wandb_run_id", type=str, default=None, help="Weights & Biases run ID for resuming.")
@@ -44,6 +48,12 @@ def parse_args():
     parser.add_argument("--use_aux_debug_loss", action="store_true", help="Use auxiliary debug loss.")
     parser.add_argument("--log_interval", type=int, default=10, help="Log interval for W&B.")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to a checkpoint to resume training from.")
+    parser.add_argument("--early_stopping_patience", type=int, default=10, help="Patience for early stopping (in epochs). Set to 0 to disable.")
+
+    # Logging & W&B
+    parser.add_argument("--log_images_interval", type=int, default=2500, help="Log example reconstructions every N global steps.")
+    parser.add_argument("--log_metrics_interval", type=int, default=1000, help="Log PSNR/SSIM/Histograms every N global steps.")
+    parser.add_argument("--is_debug", action="store_true", help="Run in debug mode on a small subset of data.")
 
     return parser.parse_args()
 
@@ -62,11 +72,32 @@ def check_gradients(model, epoch, batch_idx):
     #     print(f"Epoch {epoch}, Batch {batch_idx}: All learnable parameters have gradients.")
 # --- END: Expert's Solution 5 ---
 
+def log_advanced_metrics(reconstructed_frame_tp1, frame_tp1, min_encoding_indices, model, global_step):
+    """Calculates and logs advanced metrics like PSNR, SSIM, and codebook usage."""
+    log_dict = {}
+    
+    # Ensure images are in [0, 1] range for metrics
+    reconstructed_clamp = torch.clamp(reconstructed_frame_tp1.detach(), 0, 1)
+    original_clamp = torch.clamp(frame_tp1.detach(), 0, 1)
+    
+    # Data range is 1.0 for normalized images
+    log_dict["val/psnr"] = piq.psnr(reconstructed_clamp, original_clamp, data_range=1.0).item()
+    log_dict["val/ssim"] = piq.ssim(reconstructed_clamp, original_clamp, data_range=1.0).item()
+    
+    # Codebook usage histogram
+    if min_encoding_indices is not None:
+        indices_np = min_encoding_indices.cpu().numpy().flatten()
+        log_dict["val/codebook_usage"] = wandb.Histogram(
+            indices_np, num_bins=model.quantizer.num_embeddings
+        )
+
+    wandb.log(log_dict, step=global_step)
+
 def main():
     args = parse_args()
 
     # Setup device, logging, and W&B
-    device, my_logger_instance = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training") 
+    device, my_logger_instance = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training_Refactored") 
     message_to_log = f"Using device: {device}"
     my_logger_instance.info(message_to_log) 
     
@@ -121,15 +152,46 @@ def main():
         print(f"Warning: input_channels_per_frame is {args.input_channels_per_frame}, which is unusual. Assuming RGB (3 channels) for dataset loading unless it's 1.")
         use_grayscale = False # Default to RGB for safety if an odd number is given
 
-    train_dataset = AtariFramePairDataset(root_dir=args.data_dir, grayscale=use_grayscale)
+    full_dataset = AtariFramePairDataset(root_dir=args.data_dir, grayscale=use_grayscale)
+    
+    if args.is_debug:
+        logger.warning("Running in DEBUG mode. Using a small subset of the dataset.")
+        # Use a small, fixed subset for reproducibility in debug mode
+        dataset_subset = Subset(full_dataset, range(200))
+    else:
+        dataset_subset = full_dataset
+
+    # --- START: Create Train/Validation Split ---
+    validation_split = 0.15
+    dataset_size = len(dataset_subset)
+    indices = list(range(dataset_size))
+    split_idx = int((1 - validation_split) * dataset_size)
+    
+    # To ensure reproducibility of splits, we can use a fixed random seed for shuffling
+    random.seed(42)
+    random.shuffle(indices)
+
+    train_indices, val_indices = indices[:split_idx], indices[split_idx:]
+
+    train_sampler = torch.utils.data.SubsetRandomSampler(train_indices)
+    val_sampler = torch.utils.data.SubsetRandomSampler(val_indices)
+
     train_loader = DataLoader(
-        train_dataset, 
+        dataset_subset, 
         batch_size=args.batch_size, 
-        shuffle=True, 
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True if device != "cpu" else False
     )
-    print(f"Dataset loaded. Number of training samples: {len(train_dataset)}")
+    val_loader = DataLoader(
+        dataset_subset,
+        batch_size=args.batch_size,
+        sampler=val_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True if device != "cpu" else False
+    )
+    my_logger_instance.info(f"Dataset loaded. Training samples: {len(train_indices)}, Validation samples: {len(val_indices)}")
+    # --- END: Create Train/Validation Split ---
 
     # Model
     print("Initializing VQ-VAE model...")
@@ -138,8 +200,7 @@ def main():
         embedding_dim=args.embedding_dim,
         num_embeddings=args.num_embeddings,
         commitment_cost=args.commitment_cost,
-        frame_t_channels_for_film=args.input_channels_per_frame, # FiLM conditioning uses frame_t
-        output_channels_decoder=args.input_channels_per_frame   # Decoder outputs frame_tp1
+        dropout_p=args.dropout_p
     ).to(device)
     
     # Compile the model for potential speedup (requires PyTorch 2.0+)
@@ -157,7 +218,7 @@ def main():
         # Call wandb.watch() AFTER model is initialized and compiled
         print("Setting up wandb.watch()...")
         try:
-            wandb.watch(model, log="parameters", log_freq=100, log_graph=False)
+            wandb.watch(model, log="all", log_freq=1000)
             print("wandb.watch() setup successfully.")
         except Exception as e:
             print(f"Warning: wandb.watch() failed during setup: {e}. Proceeding without it.")
@@ -167,11 +228,18 @@ def main():
 
 
     # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    # --- START: Add LR Scheduler ---
+    # Decay LR by gamma every step_size epochs
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5, verbose=True)
+    # --- END: Add LR Scheduler ---
 
     # --- START: Logic for resuming from checkpoint ---
     start_epoch = 1
     global_step = 0
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
     if args.resume_checkpoint:
         my_logger_instance.info(f"Resuming training from checkpoint: {args.resume_checkpoint}")
         try:
@@ -196,6 +264,11 @@ def main():
                 my_logger_instance.info(f"Resumed model, optimizer, and epoch {start_epoch}. Resuming global_step from {global_step}.")
             else:
                 my_logger_instance.warning("global_step not found in checkpoint. W&B batch steps will restart from 0 for this run if not a resumed W&B run.")
+            
+            # Also resume scheduler if it was saved
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                my_logger_instance.info("Resumed LR scheduler state.")
 
         except FileNotFoundError:
             my_logger_instance.error(f"Checkpoint file not found: {args.resume_checkpoint}. Starting from scratch.")
@@ -290,7 +363,48 @@ def main():
         avg_aux_debug_loss = epoch_aux_debug_loss / len(train_loader) if args.use_aux_debug_loss and epoch_aux_debug_loss > 0 else 0
         avg_entropy_reg_term = epoch_entropy_reg_term / len(train_loader) if args.codebook_entropy_reg_weight > 0.0 else 0
 
-        my_logger_instance.info(f"Epoch {epoch}: Avg Total Loss: {avg_total_loss:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}, Avg VQ Loss: {avg_vq_loss:.4f}, Avg Perplexity: {avg_perplexity:.2f}, Avg Entropy Term: {avg_entropy_reg_term:.4f}")
+        my_logger_instance.info(f"Epoch {epoch}: Avg Train Loss: {avg_total_loss:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}, Avg VQ Loss: {avg_vq_loss:.4f}, Avg Perplexity: {avg_perplexity:.2f}, Avg Entropy Term: {avg_entropy_reg_term:.4f}")
+
+        # --- START: Validation Loop ---
+        model.eval()
+        val_loss = 0.0
+        val_recon_loss = 0.0
+        val_vq_loss = 0.0
+        val_perplexity = 0.0
+        with torch.no_grad():
+            for frame_t, frame_tp1 in tqdm(val_loader, desc=f"Epoch {epoch} Validation", leave=False):
+                frame_t, frame_tp1 = frame_t.to(device), frame_tp1.to(device)
+
+                reconstructed_frame_tp1, vq_loss_total, _, _, perplexity, _, _, _ = model(frame_t, frame_tp1)
+                
+                # Note: For validation, we typically only care about reconstruction and VQ loss.
+                # The entropy term and other regularization might not be as important to track here,
+                # but total loss gives a comparable number.
+                total_loss, reconstruction_loss, _, _, _, _, _ = model.calculate_loss(
+                    frame_tp1_original=frame_tp1, 
+                    reconstructed_frame_tp1=reconstructed_frame_tp1, 
+                    vq_loss_total_from_quantizer=vq_loss_total,
+                    # Other args can be default/None for validation loss calculation
+                    codebook_loss_from_quantizer=torch.tensor(0.0), # Not needed for val loss
+                    scaled_commitment_loss_from_quantizer=torch.tensor(0.0), # Not needed
+                    quantized_for_decoder_debug=reconstructed_frame_tp1 # Dummy value
+                )
+                val_loss += total_loss.item()
+                val_recon_loss += reconstruction_loss.item()
+                val_vq_loss += vq_loss_total.item()
+                val_perplexity += perplexity.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        avg_val_recon_loss = val_recon_loss / len(val_loader)
+        avg_val_vq_loss = val_vq_loss / len(val_loader)
+        avg_val_perplexity = val_perplexity / len(val_loader)
+
+        my_logger_instance.info(f"Epoch {epoch}: Avg Validation Loss: {avg_val_loss:.4f}, Avg Val Recon Loss: {avg_val_recon_loss:.4f}, Avg Val Perplexity: {avg_val_perplexity:.2f}")
+        
+        # Step the LR scheduler
+        scheduler.step(avg_val_loss)
+        my_logger_instance.info(f"Epoch {epoch}: Learning rate updated to {scheduler.get_last_lr()[0]}")
+        # --- END: Validation Loop ---
 
         if not args.disable_wandb: 
             epoch_log_dict = {
@@ -300,15 +414,22 @@ def main():
                 "train/epoch_codebook_loss": avg_codebook_loss, 
                 "train/epoch_commitment_loss_scaled": avg_commitment_loss, 
                 "train/epoch_perplexity": avg_perplexity,
-                "epoch": epoch
+                "epoch": epoch,
+                "learning_rate": scheduler.get_last_lr()[0] # Log current LR
             }
             if args.use_aux_debug_loss:
                 epoch_log_dict["train/epoch_aux_debug_loss"] = avg_aux_debug_loss
             if args.codebook_entropy_reg_weight > 0.0:
                 epoch_log_dict["train/epoch_entropy_reg_term"] = avg_entropy_reg_term
             
-            # Log epoch summary. The dictionary itself contains the 'epoch' key which will be used as x-axis
-            # based on define_metric("...", step_metric="epoch") for relevant keys.
+            # Add validation metrics to W&B log
+            epoch_log_dict.update({
+                "val/epoch_total_loss": avg_val_loss,
+                "val/epoch_reconstruction_loss": avg_val_recon_loss,
+                "val/epoch_vq_loss_total": avg_val_vq_loss,
+                "val/epoch_perplexity": avg_val_perplexity
+            })
+
             wandb.log(epoch_log_dict) 
             
             if len(train_loader) > 0 and epoch % args.save_interval == 0: 
@@ -325,24 +446,44 @@ def main():
                         "epoch": epoch # Ensure epoch is logged here for x-axis alignment
                     })
 
-
         # Save checkpoint
-        if epoch % args.save_interval == 0:
-            safe_env_name = args.env_name.replace("/", "_")
-            checkpoint_filename = f"{safe_env_name}_vqvae_epoch_{epoch}.pth"
-            checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_filename)
-            
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            checkpoint_path = os.path.join(args.checkpoint_dir, f"{args.env_name.replace('/', '_')}_best.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(), # Save scheduler state
                 'args': args,
-                'loss': avg_total_loss,
-                'global_step': global_step # Save global_step
+                'loss': best_val_loss,
+                'global_step': global_step
             }, checkpoint_path)
-            my_logger_instance.info(f"Saved checkpoint: {checkpoint_path}")
+            my_logger_instance.info(f"New best model saved to {checkpoint_path}")
             if not args.disable_wandb:
                 wandb.save(checkpoint_path) # Save to W&B artifacts
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            checkpoint_path = os.path.join(args.checkpoint_dir, f"{args.env_name.replace('/', '_')}_best.pth")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(), # Save scheduler state
+                'args': args,
+                'loss': best_val_loss,
+                'global_step': global_step
+            }, checkpoint_path)
+            my_logger_instance.info(f"New best model saved to {checkpoint_path}")
+            if not args.disable_wandb:
+                wandb.save(checkpoint_path) # Save to W&B artifacts
+
+        if args.early_stopping_patience > 0 and epochs_no_improve >= args.early_stopping_patience:
+            my_logger_instance.info(f"Early stopping triggered after {args.early_stopping_patience} epochs with no improvement.")
+            break
 
     if not args.disable_wandb: # Re-enable final W&B call
         wandb.finish()
