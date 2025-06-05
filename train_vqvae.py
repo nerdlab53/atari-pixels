@@ -46,7 +46,7 @@ def main():
     # Setup device, logging, and W&B
     device = setup_device_logging(args.device, args.env_name, "VQVAE_Training") # Assuming setup_device_logging handles print/logging
     if not args.disable_wandb:
-        run_name = args.wandb_run_name if args.wandb_run_name else f"{args.env_name}-vqvae-{wandb.util.generate_id()}"
+        run_name = args.wandb_run_name if args.wandb_run_name else "VQ-VAE-Ms.Pac-Man Training"
         wandb.init(project=args.wandb_project, name=run_name, config=args)
     
     print(f"VQ-VAE Training Configuration:")
@@ -84,6 +84,15 @@ def main():
         output_channels_decoder=args.input_channels_per_frame   # Decoder outputs frame_tp1
     ).to(device)
     
+    # Compile the model for potential speedup (requires PyTorch 2.0+)
+    # May have a one-time overhead for the first few batches.
+    print("Compiling model with torch.compile()...")
+    try:
+        model = torch.compile(model)
+        print("Model compiled successfully.")
+    except Exception as e:
+        print(f"Warning: Failed to compile model with torch.compile(): {e}. Proceeding without compilation.")
+
     if not args.disable_wandb:
         wandb.watch(model, log_freq=100)
     print("Model initialized.")
