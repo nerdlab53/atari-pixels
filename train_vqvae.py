@@ -59,11 +59,13 @@ def main():
 
     # Dataset and DataLoader
     print("Loading dataset...")
-    # Assuming AtariFramePairDataset expects root_dir and is structured as per generate_vqvae_data.py output
-    # It should handle transformations like ToTensor and normalization internally.
-    # If not, we need to add a transform argument.
-    # For now, let's assume it processes RGB uint8 images to float tensors in [0,1]
-    train_dataset = AtariFramePairDataset(root_dir=args.data_dir)
+    # Determine grayscale based on input_channels_per_frame argument
+    use_grayscale = True if args.input_channels_per_frame == 1 else False
+    if args.input_channels_per_frame not in [1, 3]:
+        print(f"Warning: input_channels_per_frame is {args.input_channels_per_frame}, which is unusual. Assuming RGB (3 channels) for dataset loading unless it's 1.")
+        use_grayscale = False # Default to RGB for safety if an odd number is given
+
+    train_dataset = AtariFramePairDataset(root_dir=args.data_dir, grayscale=use_grayscale)
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
