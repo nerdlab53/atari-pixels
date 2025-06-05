@@ -149,12 +149,13 @@ def main():
 
             optimizer.zero_grad()
             
-            reconstructed_frame_tp1, vq_loss, perplexity, _, min_encoding_indices = model(frame_t, frame_tp1)
+            reconstructed_frame_tp1, vq_loss, perplexity, _, min_encoding_indices, quantized_for_decoder_debug = model(frame_t, frame_tp1)
             
             total_loss, recon_loss = model.calculate_loss(
                 frame_tp1_original=frame_tp1,
                 reconstructed_frame_tp1=reconstructed_frame_tp1,
                 vq_loss=vq_loss,
+                quantized_for_decoder_debug=quantized_for_decoder_debug,
                 codebook_entropy_reg_weight=args.codebook_entropy_reg_weight,
                 min_encoding_indices=min_encoding_indices,
                 num_embeddings=args.num_embeddings

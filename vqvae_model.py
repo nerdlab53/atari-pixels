@@ -35,77 +35,65 @@ class VectorQuantizer(nn.Module):
                                where Channels is the embedding_dim.
 
         Returns:
-            quantized_latents (Tensor): Quantized latent vectors.
-                                        Shape: (Batch, Channels, Height, Width)
-            loss (Tensor): The VQ loss (commitment loss).
+            quantized_to_decoder (Tensor): Quantized latent vectors to be passed to the decoder.
+                                           This is the direct output from the codebook.
+                                           Shape: (Batch, Channels, Height, Width)
+            vq_loss (Tensor): The VQ loss (codebook loss + commitment loss).
             perplexity (Tensor): A measure of codebook usage.
             min_encodings (Tensor): The flat tensor of chosen codebook indices.
         """
-        # Reshape encoder output: (B, C, H, W) -> (B*H*W, C)
-        # C (Channels) should be equal to self.embedding_dim
         assert latents_e.shape[1] == self.embedding_dim, \
             f"Input channel dimension ({latents_e.shape[1]}) must match embedding_dim ({self.embedding_dim})"
         
         flat_latents_e = latents_e.permute(0, 2, 3, 1).contiguous().view(-1, self.embedding_dim)
         
-        # Calculate distances between encoder outputs and codebook vectors
-        # distances = sum((z_e - z_q)^2) = z_e^2 + z_q^2 - 2*z_e*z_q
-        # z_e^2: (B*H*W, 1)
-        sum_sq_latents_e = torch.sum(flat_latents_e**2, dim=1, keepdim=True)
-        # z_q^2: (1, K)
-        sum_sq_embeddings = torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
-        # -2*z_e*z_q: (B*H*W, K)
-        term_multiply = torch.matmul(flat_latents_e, self.embedding.weight.t())
+        distances = torch.sum(flat_latents_e**2, dim=1, keepdim=True) + \
+                    torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t() - \
+                    2 * torch.matmul(flat_latents_e, self.embedding.weight.t())
         
-        distances = sum_sq_latents_e + sum_sq_embeddings - 2.0 * term_multiply
-        
-        # Find the closest codebook vector (indices)
-        # min_encoding_indices shape: (B*H*W,)
         min_encoding_indices = torch.argmin(distances, dim=1)
-        
-        # Get the quantized latent vectors using the indices
-        # self.embedding.weight shape (K, D)
-        # quantized_flat shape: (B*H*W, D)
         quantized_flat = self.embedding(min_encoding_indices)
         
-        # Reshape quantized vectors back to original latent space dimensions
-        # (B*H*W, D) -> (B, H, W, D) -> (B, D, H, W)
-        quantized_latents = quantized_flat.view_as(latents_e.permute(0, 2, 3, 1).contiguous())
-        quantized_latents = quantized_latents.permute(0, 3, 1, 2).contiguous()
+        quantized_to_decoder = quantized_flat.view_as(latents_e.permute(0, 2, 3, 1).contiguous())
+        quantized_to_decoder = quantized_to_decoder.permute(0, 3, 1, 2).contiguous()
 
-        # --- Calculate VQ Loss ---
-        # 1. Commitment Loss: Encourages the encoder output to be close to the chosen codebook vector.
-        # Use detached (stopped gradient) quantized latents for the encoder's target.
-        commitment_loss = F.mse_loss(latents_e, quantized_latents.detach())
+        # --- Calculate VQ Loss (Original Formulation) ---
+        # 1. Codebook Loss (Embedding Loss): Encourages codebook vectors to move towards encoder outputs.
+        #    e_k <- z_e(x)
+        codebook_loss = F.mse_loss(quantized_to_decoder, latents_e.detach())
         
-        # 2. Codebook Loss (part of the original VQ-VAE formulation, sometimes called embedding loss):
-        # Encourages the codebook vectors to be close to the encoder outputs that map to them.
-        # This loss is applied to the codebook; encoder gradients don't flow back from this. 
-        # Modern implementations often only use commitment_loss for the VQ part and let the main 
-        # reconstruction loss update the codebook via the straight-through estimator.
-        # For simplicity and following common practice, we will primarily focus on commitment loss here 
-        # as the VQ-specific loss. The embeddings are updated via STE from the main model loss.
-        # codebook_loss = F.mse_loss(quantized_latents, latents_e.detach())
-        # vq_loss = codebook_loss + self.commitment_cost * commitment_loss
+        # 2. Commitment Loss: Encourages encoder output to commit to the chosen codebook vector.
+        #    z_e(x) <- e_k
+        commitment_loss = F.mse_loss(latents_e, quantized_to_decoder.detach())
         
-        # Simplified VQ loss: only the commitment part scaled by commitment_cost.
-        # The embeddings themselves are updated by the gradient from the decoder, passed
-        # through the straight-through estimator.
-        vq_loss = self.commitment_cost * commitment_loss
+        vq_loss = codebook_loss + self.commitment_cost * commitment_loss
 
-        # Straight-Through Estimator (STE)
-        # In the backward pass, the gradient from `quantized_latents` is copied to `latents_e`.
-        # This allows the encoder to receive gradients as if it produced the quantized values directly.
-        quantized_latents = latents_e + (quantized_latents - latents_e).detach()
+        # For STE: The gradients from the decoder will flow back to `quantized_to_decoder`
+        # and thus to `self.embedding.weight`.
+        # The encoder `latents_e` gets its gradient from the `commitment_loss` part of `vq_loss`.
+        # To allow the encoder to also benefit from the reconstruction signal as if it produced
+        # the quantized vectors, we can use the STE trick for the value passed *out* for the encoder's
+        # sake if it were part of a different loss structure.
+        # However, with the two-part vq_loss, the encoder is updated by commitment_loss,
+        # and the codebook by codebook_loss AND reconstruction_loss (propagated to quantized_to_decoder).
 
-        # --- Calculate Perplexity (a measure of codebook usage) ---
-        # This is for monitoring, not part of the loss that's optimized directly here.
-        # It indicates how many codebook vectors are being effectively used.
-        # Higher perplexity is generally better, suggesting richer codebook usage.
+        # The tensor passed to the decoder is the direct codebook output.
+        # The STE "effect" for the encoder (making it learn as if it produced the quantized codes
+        # for the reconstruction) is handled by the commitment loss.
+        # The STE "effect" for the codebook (making it learn from reconstruction error) is direct.
+        
+        # If we want latents_e to get gradient from reconstruction loss (passed to decoder):
+        # STE output to make encoder see reconstruction gradient:
+        # latents_e_for_recon_grad = latents_e + (quantized_to_decoder - latents_e).detach()
+        # But we return quantized_to_decoder to the decoder.
+        # So, latents_e is updated by commitment_loss.
+        # self.embedding.weight is updated by codebook_loss AND reconstruction_loss (via quantized_to_decoder).
+        # This is the standard and should work.
+
         avg_probs = torch.mean(torch.eye(self.num_embeddings, device=latents_e.device)[min_encoding_indices], dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
-        return quantized_latents, vq_loss, perplexity, min_encoding_indices.view(latents_e.shape[0], -1)
+        return quantized_to_decoder, vq_loss, perplexity, min_encoding_indices.view(latents_e.shape[0], -1)
 
 class Encoder(nn.Module):
     """
@@ -373,7 +361,7 @@ class VQVAE(nn.Module):
                                frame_t_channels=frame_t_channels_for_film, 
                                output_channels=output_channels_decoder)
 
-    def forward(self, frame_t: torch.Tensor, frame_tp1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, frame_t: torch.Tensor, frame_tp1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass of the VQ-VAE.
 
@@ -387,26 +375,24 @@ class VQVAE(nn.Module):
             perplexity (Tensor): The perplexity of codebook usage.
             latents_e (Tensor): The output of the encoder (before quantization).
             min_encoding_indices (Tensor): The chosen codebook indices (B, H_latent*W_latent).
+            quantized_for_decoder (Tensor): The direct output of the quantizer passed to the decoder (for debug loss).
         """
-        # Encode: frame_t and frame_tp1 -> latents_e
-        # The encoder internally computes the difference and concatenates.
         latents_e = self.encoder(frame_t, frame_tp1)
         
-        # Quantize: latents_e -> quantized_latents, vq_loss, perplexity, min_encoding_indices
-        quantized_latents, vq_loss, perplexity, min_encoding_indices = self.quantizer(latents_e)
+        quantized_for_decoder, vq_loss, perplexity, min_encoding_indices = self.quantizer(latents_e)
         
-        # Decode: quantized_latents and frame_t -> reconstructed_frame_tp1
-        reconstructed_frame_tp1 = self.decoder(quantized_latents, frame_t)
+        reconstructed_frame_tp1 = self.decoder(quantized_for_decoder, frame_t)
         
-        return reconstructed_frame_tp1, vq_loss, perplexity, latents_e, min_encoding_indices
+        return reconstructed_frame_tp1, vq_loss, perplexity, latents_e, min_encoding_indices, quantized_for_decoder
 
     def calculate_loss(self, 
                        frame_tp1_original: torch.Tensor, 
                        reconstructed_frame_tp1: torch.Tensor, 
                        vq_loss: torch.Tensor,
-                       codebook_entropy_reg_weight: float = 0.0, # Gamma in the plan
-                       min_encoding_indices: torch.Tensor | None = None, # For entropy regularization
-                       num_embeddings: int | None = None # For entropy regularization
+                       quantized_for_decoder_debug: torch.Tensor, # Added for debug
+                       codebook_entropy_reg_weight: float = 0.0, 
+                       min_encoding_indices: torch.Tensor | None = None, 
+                       num_embeddings: int | None = None
                        ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Calculates the total loss for the VQ-VAE.
@@ -420,6 +406,7 @@ class VQVAE(nn.Module):
                                                    Required if codebook_entropy_reg_weight > 0.
             num_embeddings (int, optional): Total number of embeddings in the codebook.
                                              Required if codebook_entropy_reg_weight > 0.
+            quantized_for_decoder_debug (Tensor): Output from quantizer for auxiliary debug loss.
 
         Returns:
             total_loss (Tensor): The combined loss.
@@ -447,6 +434,11 @@ class VQVAE(nn.Module):
             entropy_regularization_loss = -codebook_entropy 
             total_loss = total_loss + codebook_entropy_reg_weight * entropy_regularization_loss
         # --- END: MODIFICATION FOR CODEBOOK ENTROPY REGULARIZATION ---
+
+        # --- START: AUXILIARY DEBUG LOSS for quantizer.embedding.weight ---
+        aux_debug_loss = 0.00001 * quantized_for_decoder_debug.abs().mean()
+        total_loss = total_loss + aux_debug_loss
+        # --- END: AUXILIARY DEBUG LOSS ---
             
         return total_loss, reconstruction_loss
 
