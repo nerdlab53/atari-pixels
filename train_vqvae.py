@@ -297,18 +297,19 @@ def main():
             
             reconstructed_frame_tp1, vq_loss_total, codebook_loss, scaled_commitment_loss, perplexity, latents_e, min_encoding_indices, quantized_for_decoder = model(frame_t, frame_tp1)
             
-            total_loss, reconstruction_loss, _, _, _, aux_debug_loss_val, entropy_reg_val = model.calculate_loss(
+            # --- START: Simplified Loss Calculation ---
+            total_loss, reconstruction_loss, *_ = model.calculate_loss(
                 frame_tp1_original=frame_tp1, 
                 reconstructed_frame_tp1=reconstructed_frame_tp1, 
                 vq_loss_total_from_quantizer=vq_loss_total,
-                codebook_loss_from_quantizer=codebook_loss, # Pass through for now, though calculate_loss might not use it directly yet for total_loss
-                scaled_commitment_loss_from_quantizer=scaled_commitment_loss, # Pass through
-                quantized_for_decoder_debug=quantized_for_decoder, 
-                codebook_entropy_reg_weight=args.codebook_entropy_reg_weight if epoch >= args.codebook_entropy_warmup_epochs else 0.0,
                 min_encoding_indices=min_encoding_indices,
-                debug_embedding_weight=model.quantizer.embedding.weight if args.use_aux_debug_loss else None,
-                use_aux_debug_loss=args.use_aux_debug_loss
+                # Hardcoding old regularization args to disable them
+                codebook_entropy_reg_weight=0.0,
+                quantized_for_decoder_debug=None, 
+                debug_embedding_weight=None,
+                use_aux_debug_loss=False
             )
+            # --- END: Simplified Loss Calculation ---
             
             total_loss.backward()
 
@@ -342,10 +343,6 @@ def main():
                     "train/batch_perplexity": perplexity.item(),
                     "train/learning_rate": optimizer.param_groups[0]['lr']
                 }
-                if args.use_aux_debug_loss and aux_debug_loss_val is not None:
-                    log_dict["train/batch_aux_debug_loss"] = aux_debug_loss_val.item()
-                if entropy_reg_val is not None:
-                    log_dict["train/batch_entropy_reg_term"] = entropy_reg_val.item()
                 wandb.log(log_dict, step=global_step) # Use global_step for batch logging
             progress_bar.set_postfix({
                 "Total Loss": f"{total_loss.item():.4f}",
@@ -375,20 +372,21 @@ def main():
             for frame_t, frame_tp1 in tqdm(val_loader, desc=f"Epoch {epoch} Validation", leave=False):
                 frame_t, frame_tp1 = frame_t.to(device), frame_tp1.to(device)
 
-                reconstructed_frame_tp1, vq_loss_total, _, _, perplexity, _, _, _ = model(frame_t, frame_tp1)
+                reconstructed_frame_tp1, vq_loss_total, _, _, perplexity, _, min_encoding_indices, _ = model(frame_t, frame_tp1)
                 
-                # Note: For validation, we typically only care about reconstruction and VQ loss.
-                # The entropy term and other regularization might not be as important to track here,
-                # but total loss gives a comparable number.
-                total_loss, reconstruction_loss, _, _, _, _, _ = model.calculate_loss(
+                # --- START: Simplified Loss Calculation for Validation ---
+                total_loss, reconstruction_loss, *_ = model.calculate_loss(
                     frame_tp1_original=frame_tp1, 
                     reconstructed_frame_tp1=reconstructed_frame_tp1, 
                     vq_loss_total_from_quantizer=vq_loss_total,
-                    # Other args can be default/None for validation loss calculation
-                    codebook_loss_from_quantizer=torch.tensor(0.0), # Not needed for val loss
-                    scaled_commitment_loss_from_quantizer=torch.tensor(0.0), # Not needed
-                    quantized_for_decoder_debug=reconstructed_frame_tp1 # Dummy value
+                    min_encoding_indices=min_encoding_indices,
+                    # Hardcoding old regularization args to disable them
+                    codebook_entropy_reg_weight=0.0,
+                    quantized_for_decoder_debug=None, 
+                    debug_embedding_weight=None,
+                    use_aux_debug_loss=False
                 )
+                # --- END: Simplified Loss Calculation for Validation ---
                 val_loss += total_loss.item()
                 val_recon_loss += reconstruction_loss.item()
                 val_vq_loss += vq_loss_total.item()
