@@ -36,9 +36,9 @@ class VectorQuantizer(nn.Module):
 
         Returns:
             quantized_to_decoder (Tensor): Quantized latent vectors to be passed to the decoder.
-                                           This is the direct output from the codebook.
-                                           Shape: (Batch, Channels, Height, Width)
-            vq_loss (Tensor): The VQ loss (codebook loss + commitment loss).
+            vq_loss (Tensor): The total VQ loss.
+            codebook_loss (Tensor): The codebook loss component.
+            commitment_loss (Tensor): The commitment loss component (scaled by commitment_cost).
             perplexity (Tensor): A measure of codebook usage.
             min_encodings (Tensor): The flat tensor of chosen codebook indices.
         """
@@ -64,9 +64,10 @@ class VectorQuantizer(nn.Module):
         
         # 2. Commitment Loss: Encourages encoder output to commit to the chosen codebook vector.
         #    z_e(x) <- e_k
-        commitment_loss = F.mse_loss(latents_e, quantized_to_decoder.detach())
+        commitment_loss_term = F.mse_loss(latents_e, quantized_to_decoder.detach())
         
-        vq_loss = codebook_loss + self.commitment_cost * commitment_loss
+        scaled_commitment_loss = self.commitment_cost * commitment_loss_term
+        total_vq_specific_loss = codebook_loss + scaled_commitment_loss
 
         # For STE: The gradients from the decoder will flow back to `quantized_to_decoder`
         # and thus to `self.embedding.weight`.
@@ -93,7 +94,7 @@ class VectorQuantizer(nn.Module):
         avg_probs = torch.mean(torch.eye(self.num_embeddings, device=latents_e.device)[min_encoding_indices], dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
-        return quantized_to_decoder, vq_loss, perplexity, min_encoding_indices.view(latents_e.shape[0], -1)
+        return quantized_to_decoder, total_vq_specific_loss, codebook_loss, scaled_commitment_loss, perplexity, min_encoding_indices.view(latents_e.shape[0], -1)
 
 class Encoder(nn.Module):
     """
@@ -349,7 +350,8 @@ class VQVAE(nn.Module):
                  num_embeddings: int, 
                  commitment_cost: float,
                  frame_t_channels_for_film: int, # Should be same as input_channels_per_frame
-                 output_channels_decoder: int # Should be same as input_channels_per_frame
+                 output_channels_decoder: int, # Should be same as input_channels_per_frame
+                 codebook_entropy_reg_weight: float = 0.0
                  ):
         super().__init__()
         self.encoder = Encoder(input_channels_per_frame=input_channels_per_frame, 
@@ -360,87 +362,128 @@ class VQVAE(nn.Module):
         self.decoder = Decoder(embedding_dim=embedding_dim, 
                                frame_t_channels=frame_t_channels_for_film, 
                                output_channels=output_channels_decoder)
+        self.codebook_entropy_reg_weight = codebook_entropy_reg_weight # Store for use in calculate_loss
 
-    def forward(self, frame_t: torch.Tensor, frame_tp1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, frame_t: torch.Tensor, frame_tp1: torch.Tensor) -> tuple[
+        torch.Tensor, # reconstructed_frame_tp1
+        torch.Tensor, # vq_loss_total (sum of codebook and scaled commitment)
+        torch.Tensor, # codebook_loss (unscaled)
+        torch.Tensor, # scaled_commitment_loss
+        torch.Tensor, # perplexity
+        torch.Tensor, # latents_e (encoder output pre-quantization)
+        torch.Tensor, # min_encoding_indices (chosen codebook indices)
+        torch.Tensor  # quantized_for_decoder (quantizer output to decoder)
+    ]:
         """
         Forward pass of the VQ-VAE.
 
         Args:
-            frame_t (Tensor): Batch of current frames (B, C, H, W).
-            frame_tp1 (Tensor): Batch of next frames (B, C, H, W).
+            frame_t (Tensor): The current frame (B, C, H, W).
+            frame_tp1 (Tensor): The next frame (B, C, H, W).
 
         Returns:
             reconstructed_frame_tp1 (Tensor): The decoder's reconstruction of frame_tp1.
-            vq_loss (Tensor): The loss from the VQ layer.
-            perplexity (Tensor): The perplexity of codebook usage.
+            vq_loss_total (Tensor): The total VQ loss (codebook_loss + scaled_commitment_loss).
+            codebook_loss (Tensor): The unscaled codebook loss component from VQ.
+            scaled_commitment_loss (Tensor): The scaled commitment loss component from VQ.
+            perplexity (Tensor): A measure of codebook usage.
             latents_e (Tensor): The output of the encoder (before quantization).
             min_encoding_indices (Tensor): The chosen codebook indices (B, H_latent*W_latent).
-            quantized_for_decoder (Tensor): The direct output of the quantizer passed to the decoder (for debug loss).
+            quantized_for_decoder (Tensor): The direct output of the quantizer passed to the decoder.
         """
         latents_e = self.encoder(frame_t, frame_tp1)
         
-        quantized_for_decoder, vq_loss, perplexity, min_encoding_indices = self.quantizer(latents_e)
+        quantized_for_decoder, vq_loss_total, codebook_loss, scaled_commitment_loss, perplexity, min_encoding_indices = self.quantizer(latents_e)
         
         reconstructed_frame_tp1 = self.decoder(quantized_for_decoder, frame_t)
         
-        return reconstructed_frame_tp1, vq_loss, perplexity, latents_e, min_encoding_indices, quantized_for_decoder
+        return reconstructed_frame_tp1, vq_loss_total, codebook_loss, scaled_commitment_loss, perplexity, latents_e, min_encoding_indices, quantized_for_decoder
 
     def calculate_loss(self, 
                        frame_tp1_original: torch.Tensor, 
                        reconstructed_frame_tp1: torch.Tensor, 
-                       vq_loss: torch.Tensor,
-                       quantized_for_decoder_debug: torch.Tensor, # Added for debug
-                       codebook_entropy_reg_weight: float = 0.0, 
+                       vq_loss_total_from_quantizer: torch.Tensor, 
+                       codebook_loss_from_quantizer: torch.Tensor, # Added
+                       scaled_commitment_loss_from_quantizer: torch.Tensor, # Added
+                       quantized_for_decoder_debug: torch.Tensor, 
+                       codebook_entropy_reg_weight: float = 0.0, # Can override class default
                        min_encoding_indices: torch.Tensor | None = None, 
-                       num_embeddings: int | None = None
-                       ) -> tuple[torch.Tensor, torch.Tensor]:
+                       debug_embedding_weight: torch.Tensor | None = None, 
+                       use_aux_debug_loss: bool = False
+                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Calculates the total loss for the VQ-VAE.
 
         Args:
             frame_tp1_original (Tensor): The original next frame.
             reconstructed_frame_tp1 (Tensor): The VQ-VAE's reconstruction of the next frame.
-            vq_loss (Tensor): The VQ loss (commitment loss) from the quantizer.
+            vq_loss_total_from_quantizer (Tensor): The total VQ loss from the quantizer (codebook + scaled commitment).
+            codebook_loss_from_quantizer (Tensor): The unscaled codebook loss component from VQ.
+            scaled_commitment_loss_from_quantizer (Tensor): The scaled commitment loss component from VQ.
+            quantized_for_decoder_debug (Tensor): Output of quantizer (passed to decoder), for potential debug loss.
             codebook_entropy_reg_weight (float): Weight for the codebook entropy regularization term.
             min_encoding_indices (Tensor, optional): Flat tensor of chosen codebook indices from VQ layer.
-                                                   Required if codebook_entropy_reg_weight > 0.
-            num_embeddings (int, optional): Total number of embeddings in the codebook.
-                                             Required if codebook_entropy_reg_weight > 0.
-            quantized_for_decoder_debug (Tensor): Output from quantizer for auxiliary debug loss.
+                                                  Required if codebook_entropy_reg_weight > 0.
+            debug_embedding_weight (Tensor, optional): The quantizer's embedding weight for aux debug loss.
+            use_aux_debug_loss (bool): Flag to enable the auxiliary debug loss.
 
         Returns:
-            total_loss (Tensor): The combined loss.
+            total_loss (Tensor): The overall loss.
             reconstruction_loss (Tensor): The MSE reconstruction loss.
+            vq_loss_total_from_quantizer (Tensor): The VQ loss passed through (already sum of its components).
+            codebook_loss_from_quantizer (Tensor): The unscaled codebook loss (passed through).
+            scaled_commitment_loss_from_quantizer (Tensor): The scaled commitment loss (passed through).
+            aux_debug_loss_value (Tensor | None): The value of the auxiliary debug loss if used, else None.
         """
         reconstruction_loss = F.mse_loss(reconstructed_frame_tp1, frame_tp1_original)
         
-        total_loss = reconstruction_loss + vq_loss
+        # The vq_loss_total_from_quantizer already includes codebook and scaled commitment loss
+        total_loss = reconstruction_loss + vq_loss_total_from_quantizer
 
         # --- START: MODIFICATION FOR CODEBOOK ENTROPY REGULARIZATION ---
-        if codebook_entropy_reg_weight > 0:
-            if min_encoding_indices is None or num_embeddings is None:
-                raise ValueError("min_encoding_indices and num_embeddings must be provided for codebook entropy regularization.")
-            
-            # Calculate empirical distribution of codebook usage
-            # min_encoding_indices is (B*H_latent*W_latent,)
-            counts = torch.bincount(min_encoding_indices.flatten(), minlength=num_embeddings)
-            probs = counts.float() / counts.sum()
-            
+        if codebook_entropy_reg_weight > 0.0:
+            if min_encoding_indices is None:
+                raise ValueError("min_encoding_indices must be provided for codebook entropy regularization.")
+            # Calculate codebook entropy. min_encoding_indices is (B, H_latent*W_latent)
+            # Count occurrences of each code index
+            # Ensure indices are within the valid range [0, num_embeddings-1]
+            num_embeddings = self.quantizer.num_embeddings
+            counts = torch.zeros(num_embeddings, device=min_encoding_indices.device)
+            # Unique counts for each index
+            unique_indices, counts_for_unique = torch.unique(min_encoding_indices, return_counts=True)
+            counts.scatter_add_(0, unique_indices, counts_for_unique.float())
+
+            # Normalize to get probabilities
+            probs = counts / counts.sum()
             # Calculate entropy: -sum(p * log(p))
-            # Add epsilon to prevent log(0)
-            codebook_entropy = -torch.sum(probs * torch.log(probs + 1e-10))
-            
-            # We want to maximize entropy, so we minimize negative entropy.
-            entropy_regularization_loss = -codebook_entropy 
-            total_loss = total_loss + codebook_entropy_reg_weight * entropy_regularization_loss
+            # Add a small epsilon to prevent log(0)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+            # We want to maximize entropy, so we subtract it from the loss
+            total_loss -= codebook_entropy_reg_weight * entropy
         # --- END: MODIFICATION FOR CODEBOOK ENTROPY REGULARIZATION ---
 
-        # --- START: AUXILIARY DEBUG LOSS for quantizer.embedding.weight ---
-        aux_debug_loss = 0.00001 * quantized_for_decoder_debug.abs().mean()
-        total_loss = total_loss + aux_debug_loss
-        # --- END: AUXILIARY DEBUG LOSS ---
+        # Auxiliary debug loss (remains for now)
+        aux_debug_loss_value = None
+        if use_aux_debug_loss and debug_embedding_weight is not None:
+            # Example: Force some gradient onto a specific part of the quantized output or embedding
+            # This is a placeholder and needs to be specific to what's being debugged.
+            # Here, let's try to push the mean of the first embedding vector towards 0.1
+            # This is arbitrary and just for testing gradient flow.
+            # Ensure debug_embedding_weight is used to make it part of the graph if it's a parameter
+            # target_value = torch.tensor(0.1, device=quantized_for_decoder_debug.device)
+            # aux_debug_loss = F.mse_loss(quantized_for_decoder_debug.mean(), target_value) 
+            # A more direct way to check embedding grad:
+            if debug_embedding_weight.grad is not None:
+                debug_embedding_weight.grad.zero_()
             
-        return total_loss, reconstruction_loss
+            # Let's assume we want to push the mean of the first embedding vector towards a target value
+            target_value_emb = torch.tensor(0.05, device=debug_embedding_weight.device, dtype=debug_embedding_weight.dtype)
+            aux_debug_loss = F.mse_loss(debug_embedding_weight[0].mean(), target_value_emb) * 0.001 # Small weight
+
+            total_loss += aux_debug_loss
+            aux_debug_loss_value = aux_debug_loss.detach() # Detach for logging
+
+        return total_loss, reconstruction_loss, vq_loss_total_from_quantizer, codebook_loss_from_quantizer, scaled_commitment_loss_from_quantizer, aux_debug_loss_value
 
 # Next: VQVAE main model
 

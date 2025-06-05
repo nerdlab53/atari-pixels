@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import wandb
 from tqdm import tqdm
+from datetime import datetime
 
 from vqvae_model import VQVAE
 from latent_action_data import AtariFramePairDataset # Using the existing dataset
@@ -37,6 +38,11 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default="atari-vqvae", help="Weights & Biases project name.")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name. Defaults to env_name-vqvae-timestamp.")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging.")
+    parser.add_argument("--wandb_run_id", type=str, default=None, help="Weights & Biases run ID for resuming.")
+    parser.add_argument("--run_name", type=str, default="VQ-VAE", help="Name for the run.")
+    parser.add_argument("--codebook_entropy_warmup_epochs", type=int, default=0, help="Epochs to warm up codebook entropy regularization.")
+    parser.add_argument("--use_aux_debug_loss", action="store_true", help="Use auxiliary debug loss.")
+    parser.add_argument("--log_interval", type=int, default=10, help="Log interval for W&B.")
 
     return parser.parse_args()
 
@@ -61,12 +67,29 @@ def main():
     # Setup device, logging, and W&B
     device = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training") 
     
-    wandb_initialized = False
+    logger.info(f"Using device: {device}")
+    wandb_run = None
     if not args.disable_wandb:
-        run_name = args.wandb_run_name if args.wandb_run_name else "VQ-VAE-Ms.Pac-Man Training"
-        wandb.init(project=args.wandb_project, name=run_name, config=args)
-        wandb_initialized = True
-        # wandb.watch() will be called AFTER model initialization
+        if args.wandb_run_id:
+            run_id = args.wandb_run_id
+            run_name = f"{args.run_name}_resume_{run_id[:8]}"
+        else:
+            run_id = wandb.util.generate_id()
+            run_name = f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        logger.info(f"Initializing W&B run with name: {run_name} and ID: {run_id}")
+        
+        config_to_log = vars(args).copy()
+        config_to_log['actual_device'] = device.type # Add the actual device type
+
+        wandb_run = wandb.init(
+            project=args.wandb_project, 
+            name=run_name, 
+            id=run_id, 
+            config=config_to_log, # Log updated config
+            resume="allow" if args.wandb_run_id else None
+        )
+        logger.info(f"W&B run initialized. Run URL: {wandb_run.url if wandb_run else 'N/A'}")
 
     print(f"VQ-VAE Training Configuration:")
     for arg, value in vars(args).items():
@@ -116,7 +139,7 @@ def main():
     #     print(f"Warning: Failed to compile model with torch.compile(): {e}. Proceeding without compilation.")
     # --- END TEMPORARILY DISABLING TORCH.COMPILE ---
 
-    if wandb_initialized:
+    if wandb_run:
         # Call wandb.watch() AFTER model is initialized and compiled
         print("Setting up wandb.watch()...")
         try:
@@ -141,24 +164,29 @@ def main():
         epoch_recon_loss = 0
         epoch_vq_loss = 0
         epoch_perplexity = 0
+        epoch_codebook_loss = 0
+        epoch_commitment_loss = 0
+        epoch_aux_debug_loss = 0
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs}", leave=False)
         for batch_idx, (frame_t, frame_tp1) in enumerate(progress_bar):
-            frame_t = frame_t.to(device)
-            frame_tp1 = frame_tp1.to(device)
+            frame_t, frame_tp1 = frame_t.to(device), frame_tp1.to(device)
 
             optimizer.zero_grad()
             
-            reconstructed_frame_tp1, vq_loss, perplexity, _, min_encoding_indices, quantized_for_decoder_debug = model(frame_t, frame_tp1)
+            reconstructed_frame_tp1, vq_loss_total, codebook_loss, scaled_commitment_loss, perplexity, latents_e, min_encoding_indices, quantized_for_decoder = model(frame_t, frame_tp1)
             
-            total_loss, recon_loss = model.calculate_loss(
-                frame_tp1_original=frame_tp1,
-                reconstructed_frame_tp1=reconstructed_frame_tp1,
-                vq_loss=vq_loss,
-                quantized_for_decoder_debug=quantized_for_decoder_debug,
-                codebook_entropy_reg_weight=args.codebook_entropy_reg_weight,
+            total_loss, reconstruction_loss, _, _, _, aux_debug_loss_val = model.calculate_loss(
+                frame_tp1_original=frame_tp1, 
+                reconstructed_frame_tp1=reconstructed_frame_tp1, 
+                vq_loss_total_from_quantizer=vq_loss_total,
+                codebook_loss_from_quantizer=codebook_loss, # Pass through for now, though calculate_loss might not use it directly yet for total_loss
+                scaled_commitment_loss_from_quantizer=scaled_commitment_loss, # Pass through
+                quantized_for_decoder_debug=quantized_for_decoder, 
+                codebook_entropy_reg_weight=args.codebook_entropy_reg_weight if epoch >= args.codebook_entropy_warmup_epochs else 0.0,
                 min_encoding_indices=min_encoding_indices,
-                num_embeddings=args.num_embeddings
+                debug_embedding_weight=model.quantizer.embedding.weight if args.use_aux_debug_loss else None,
+                use_aux_debug_loss=args.use_aux_debug_loss
             )
             
             total_loss.backward()
@@ -172,41 +200,51 @@ def main():
             optimizer.step()
             
             epoch_total_loss += total_loss.item()
-            epoch_recon_loss += recon_loss.item()
-            epoch_vq_loss += vq_loss.item() # vq_loss is a component of total_loss, but good to track separately
+            epoch_recon_loss += reconstruction_loss.item()
+            epoch_vq_loss += vq_loss_total.item() # This is the sum of codebook and commitment losses
+            epoch_codebook_loss += codebook_loss.item() # Log individual component
+            epoch_commitment_loss += scaled_commitment_loss.item() # Log individual component
             epoch_perplexity += perplexity.item()
+            if aux_debug_loss_val is not None:
+                epoch_aux_debug_loss += aux_debug_loss_val.item()
 
             if not args.disable_wandb: # Re-enable W&B logging inside the loop
                 wandb.log({
                     "train/batch_total_loss": total_loss.item(),
-                    "train/batch_recon_loss": recon_loss.item(),
-                    "train/batch_vq_loss": vq_loss.item(),
+                    "train/batch_reconstruction_loss": reconstruction_loss.item(),
+                    "train/batch_vq_loss_total": vq_loss_total.item(),
+                    "train/batch_codebook_loss": codebook_loss.item(),
+                    "train/batch_commitment_loss_scaled": scaled_commitment_loss.item(),
                     "train/batch_perplexity": perplexity.item(),
-                    "epoch": epoch,
-                    "batch_idx": batch_idx
-                })
+                    "train/learning_rate": optimizer.param_groups[0]['lr']
+                }, step=batch_idx)
             progress_bar.set_postfix({
                 "Total Loss": f"{total_loss.item():.4f}",
-                "Recon Loss": f"{recon_loss.item():.4f}",
-                "VQ Loss": f"{vq_loss.item():.4f}",
+                "Recon Loss": f"{reconstruction_loss.item():.4f}",
+                "VQ Loss": f"{vq_loss_total.item():.4f}",
                 "Perplexity": f"{perplexity.item():.2f}"
             })
 
         avg_total_loss = epoch_total_loss / len(train_loader)
         avg_recon_loss = epoch_recon_loss / len(train_loader)
         avg_vq_loss = epoch_vq_loss / len(train_loader)
+        avg_codebook_loss = epoch_codebook_loss / len(train_loader)
+        avg_commitment_loss = epoch_commitment_loss / len(train_loader)
         avg_perplexity = epoch_perplexity / len(train_loader)
+        avg_aux_debug_loss = epoch_aux_debug_loss / len(train_loader) if args.use_aux_debug_loss else 0
 
         print(f"Epoch {epoch}: Avg Total Loss: {avg_total_loss:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}, Avg VQ Loss: {avg_vq_loss:.4f}, Avg Perplexity: {avg_perplexity:.2f}")
 
         if not args.disable_wandb: # Re-enable W&B logging for epoch summaries
             wandb.log({
                 "train/epoch_total_loss": avg_total_loss,
-                "train/epoch_recon_loss": avg_recon_loss,
-                "train/epoch_vq_loss": avg_vq_loss,
+                "train/epoch_reconstruction_loss": avg_recon_loss,
+                "train/epoch_vq_loss_total": avg_vq_loss,
+                "train/epoch_codebook_loss": avg_codebook_loss,
+                "train/epoch_commitment_loss_scaled": avg_commitment_loss,
                 "train/epoch_perplexity": avg_perplexity,
                 "epoch": epoch
-            })
+            }, step=epoch)
             
             # Log some reconstructed images
             if batch_idx == 0 and epoch % args.save_interval == 0: # Log from first batch of epoch
