@@ -245,6 +245,69 @@ class DQNCNN(nn.Module):
         
         return q_values
 
+# --- LSTM DQN CNN Architecture --- #
+class DQNCNN_LSTM(nn.Module):
+    """CNN architecture for DQN, followed by an LSTM layer.
+    
+    Architecture:
+    1. Input: (batch_size, C_in, H, W) - e.g., (N, 8, 84, 84) stacked frames
+    2. Conv layers process spatial features
+    3. Flatten conv output
+    4. LSTM layer processes flattened conv output (treated as sequence of length 1)
+    5. Fully connected layers compute Q-values from LSTM output
+    """
+    def __init__(self, input_shape, n_actions, lstm_hidden_size=512):
+        super().__init__()
+        c, h, w = input_shape
+        self.conv = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        
+        def conv2d_size_out(size, kernel_size, stride):
+            return (size - kernel_size) // stride + 1
+        convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w, 8, 4), 4, 2), 3, 1)
+        convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
+        linear_input_size = convw * convh * 64
+
+        self.lstm_hidden_size = lstm_hidden_size
+        self.lstm = nn.LSTM(input_size=linear_input_size, hidden_size=lstm_hidden_size, batch_first=True)
+
+        self.fc_stream = nn.Sequential(
+            nn.Linear(lstm_hidden_size, 512), # Input from LSTM
+            nn.GELU(),
+            nn.Linear(512, n_actions)
+        )
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu') # GELU benefits from relu-like init
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        # LSTM weights are initialized by PyTorch default, which is usually fine.
+
+    def forward(self, x, hidden_state):
+        x = x.float() / 255.0
+        features = self.conv(x)
+        features = features.view(features.size(0), -1) # Flatten: (N, linear_input_size)
+        
+        # Reshape for LSTM: (N, seq_len=1, input_size)
+        features_lstm = features.unsqueeze(1)
+        
+        lstm_out, new_hidden_state = self.lstm(features_lstm, hidden_state)
+        
+        # Use output of LSTM from the last time step (only one here)
+        lstm_out_last_step = lstm_out.squeeze(1) # (N, lstm_hidden_size)
+        
+        q_values = self.fc_stream(lstm_out_last_step)
+        return q_values, new_hidden_state
+
 class DQNAgent:
     """Deep Q-Network agent implementing several DQN improvements.
     
@@ -273,12 +336,25 @@ class DQNAgent:
        - Clips gradient norm to 1.0
        - Maintains stable updates
     """
-    def __init__(self, n_actions: int, state_shape, replay_buffer=None, prioritized=False, per_alpha=0.6, per_beta=0.4, device=None):
+    def __init__(self, n_actions: int, state_shape, replay_buffer=None, 
+                 prioritized=False, per_alpha=0.6, per_beta=0.4, device=None,
+                 use_lstm: bool = False, lstm_hidden_size: int = 512):
         """Initialize DQN agent with networks and replay buffer."""
         self.n_actions = n_actions
         self.state_shape = state_shape
-        self.policy_net = DQNCNN(state_shape, n_actions)
-        self.target_net = DQNCNN(state_shape, n_actions)
+        self.use_lstm = use_lstm
+        self.lstm_hidden_size = lstm_hidden_size
+
+        if self.use_lstm:
+            self.policy_net = DQNCNN_LSTM(state_shape, n_actions, lstm_hidden_size=self.lstm_hidden_size)
+            self.target_net = DQNCNN_LSTM(state_shape, n_actions, lstm_hidden_size=self.lstm_hidden_size)
+            self.current_episode_hidden_state = None # For managing LSTM state during an episode
+            self.reset_hidden_state() # Initialize for episode interaction
+        else:
+            self.policy_net = DQNCNN(state_shape, n_actions)
+            self.target_net = DQNCNN(state_shape, n_actions)
+            self.current_episode_hidden_state = None # Not used, but keep attribute for consistency
+
         self.prioritized = prioritized
         if replay_buffer is not None:
             self.replay_buffer = replay_buffer
@@ -316,17 +392,56 @@ class DQNAgent:
         #     else:
         #         print("INFO: torch.compile skipped for policy_net (torch.compile not available).")
 
+    def reset_hidden_state(self, batch_size=1):
+        """Resets the LSTM hidden state for the policy network for interactive rollouts."""
+        if not self.use_lstm:
+            self.current_episode_hidden_state = None
+            return
+        # For single (episode) interaction, batch_size is 1.
+        h0 = torch.zeros(1, batch_size, self.lstm_hidden_size, device=self.device) # (num_layers, batch, hidden_size)
+        c0 = torch.zeros(1, batch_size, self.lstm_hidden_size, device=self.device)
+        self.current_episode_hidden_state = (h0, c0)
+
+    def _get_initial_hidden_state_for_batch(self, batch_size_override=None):
+        """Returns a zero initial hidden state for a batch, used in optimize_model."""
+        if not self.use_lstm:
+            return None
+        current_batch_size = batch_size_override if batch_size_override is not None else self.batch_size
+        h0 = torch.zeros(1, current_batch_size, self.lstm_hidden_size, device=self.device)
+        c0 = torch.zeros(1, current_batch_size, self.lstm_hidden_size, device=self.device)
+        return (h0, c0)
+
     def select_action(self, state, epsilon: float = 0.0) -> int:
         """Select action using epsilon-greedy policy."""
         if random.random() < epsilon:
+            # If using LSTM and taking a random action, the hidden state ideally should still advance based on the true state,
+            # or be reset. For simplicity, we currently don't update self.current_episode_hidden_state here.
+            # The next non-random action will use the existing self.current_episode_hidden_state.
+            # This means the LSTM's sequence is effectively interrupted by random actions.
             return random.randrange(self.n_actions)
         else:
-            state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
-            self.policy_net.eval() # Set to evaluation mode for deterministic Q-values
+            if isinstance(state, np.ndarray):
+                # Convert NumPy array to tensor, add batch dim, move to device
+                state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+            elif torch.is_tensor(state):
+                # Ensure tensor is on the correct device and has batch dim
+                state_tensor = state.to(self.device)
+                if state_tensor.ndim == 3: # (C, H, W) -> (1, C, H, W)
+                    state_tensor = state_tensor.unsqueeze(0)
+                state_tensor = state_tensor.float() # Ensure it's float
+            else:
+                raise TypeError(f"Expected state to be np.ndarray or torch.Tensor, got {type(state)}")
+
+            self.policy_net.eval() # Set to evaluation mode for inference
             with torch.no_grad():
-                q_values = self.policy_net(state_tensor)
+                if self.use_lstm:
+                    if self.current_episode_hidden_state is None or self.current_episode_hidden_state[0].size(1) != 1:
+                        self.reset_hidden_state(batch_size=1) # Ensure correct batch size for inference
+                    q_values, new_hidden = self.policy_net(state_tensor, self.current_episode_hidden_state)
+                    self.current_episode_hidden_state = (new_hidden[0].detach(), new_hidden[1].detach()) # Update for next step
+                else:
+                    q_values = self.policy_net(state_tensor)
                 action = int(torch.argmax(q_values, dim=1).item())
-            # self.policy_net.train() # Revert to train mode if optimize_model doesn't handle it
             return action
 
     def optimize_model(self, mode: str = 'exploitation', alpha: float = 0.5):
@@ -358,16 +473,27 @@ class DQNAgent:
         next_states = torch.from_numpy(np.stack(next_states)).to(self.device).float()
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
         
+        initial_hidden_batch = self._get_initial_hidden_state_for_batch()
+
         # Calculate current Q-values
-        q_values = self.policy_net(states).gather(1, actions)
+        if self.use_lstm:
+            q_values_all, _ = self.policy_net(states, initial_hidden_batch)
+        else:
+            q_values_all = self.policy_net(states)
+        q_values = q_values_all.gather(1, actions)
         
         # Calculate target Q-values (Double DQN)
         with torch.no_grad():
-            # Select actions using policy net
-            next_actions = self.policy_net(next_states).max(1, keepdim=True)[1]
-            # Evaluate actions using target net
-            next_q_values = self.target_net(next_states).gather(1, next_actions)
-            # Calculate targets
+            if self.use_lstm:
+                next_q_values_policy_all, _ = self.policy_net(next_states, initial_hidden_batch)
+                next_actions = next_q_values_policy_all.max(1, keepdim=True)[1]
+                next_q_values_target_all, _ = self.target_net(next_states, initial_hidden_batch)
+            else:
+                next_q_values_policy_all = self.policy_net(next_states)
+                next_actions = next_q_values_policy_all.max(1, keepdim=True)[1]
+                next_q_values_target_all = self.target_net(next_states)
+            
+            next_q_values = next_q_values_target_all.gather(1, next_actions)
             target_q = rewards + self.gamma * next_q_values * (1.0 - dones)
         
         # Calculate TD errors and loss
@@ -525,7 +651,12 @@ class DQNAgent:
         state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
         self.policy_net.eval()
         with torch.no_grad():
-            q_values = self.policy_net(state_tensor)
+            if self.use_lstm:
+                # For a one-off eval, use a fresh zero hidden state
+                initial_hidden = self._get_initial_hidden_state_for_batch(batch_size_override=1)
+                q_values, _ = self.policy_net(state_tensor, initial_hidden)
+            else:
+                q_values = self.policy_net(state_tensor)
             logits = q_values / max(temperature, 1e-6)
             probs = torch.softmax(logits, dim=1).cpu().numpy().flatten()
         return probs
@@ -541,7 +672,13 @@ class DQNAgent:
         state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
         self.policy_net.eval()
         with torch.no_grad():
-            q_values = self.policy_net(state_tensor).cpu().numpy().flatten()
+            if self.use_lstm:
+                # For a one-off eval, use a fresh zero hidden state
+                initial_hidden = self._get_initial_hidden_state_for_batch(batch_size_override=1)
+                q_values_tensor, _ = self.policy_net(state_tensor, initial_hidden)
+            else:
+                q_values_tensor = self.policy_net(state_tensor)
+            q_values = q_values_tensor.cpu().numpy().flatten()
         return q_values
 
     def get_weight_norms(self):

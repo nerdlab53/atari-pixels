@@ -36,7 +36,8 @@ config = {
     'per_beta_frames': 1000000,  # Frames over which to anneal beta for PER
     'epsilon_start': 1.0,
     'epsilon_final': 0.1, # Standard final epsilon for Atari
-    'epsilon_decay_steps': 1000000 # Decay over 1M steps
+    'epsilon_decay_steps': 1000000, # Decay over 1M steps
+    'lstm_hidden_size': 512     # Default hidden size for LSTM layer if used
 }
 
 # Set seeds and deterministic flags
@@ -57,6 +58,8 @@ print(f"Using device: {device}")
 
 # --- Generic Atari Environment --- #
 class AtariEnv:
+    metadata = {'render_modes': ['rgb_array', 'human'], 'render_fps': 30}
+
     def __init__(self, game_id='ALE/Breakout-v5', screen_height=84, screen_width=84, num_stack=8, seed=None, render_mode=None):
         if seed is not None:
             self.env = gym.make(game_id, obs_type="grayscale", render_mode=render_mode, full_action_space=False)
@@ -134,6 +137,9 @@ def evaluate_agent(agent, env, n_episodes=10, log_id=None, return_q_values=False
     all_q_values = []
     for ep in range(n_episodes):
         obs, info = env.reset()
+        # If agent uses LSTM, reset its hidden state for the new evaluation episode
+        eval_ep_hidden_state = agent._get_initial_hidden_state_for_batch(batch_size_override=1) if agent.use_lstm else None
+        
         state_stack = np.array(obs)
         done = False
         total_reward = 0
@@ -141,9 +147,14 @@ def evaluate_agent(agent, env, n_episodes=10, log_id=None, return_q_values=False
             state_tensor = torch.from_numpy(state_stack.astype(np.float32)).unsqueeze(0).to(agent.device)
             agent.policy_net.eval()
             with torch.no_grad():
-                q_values_tensor = agent.policy_net(state_tensor)
+                if agent.use_lstm:
+                    q_values_tensor, new_eval_ep_hidden = agent.policy_net(state_tensor, eval_ep_hidden_state)
+                    eval_ep_hidden_state = (new_eval_ep_hidden[0].detach(), new_eval_ep_hidden[1].detach()) # Update for next step in eval episode
+                else:
+                    q_values_tensor = agent.policy_net(state_tensor)
+                
                 q_values = q_values_tensor.cpu().numpy().flatten()
-                if np.random.rand() < 0.05:
+                if np.random.rand() < 0.05: # Small epsilon for evaluation
                     action = np.random.randint(0, config['n_actions'])
                 else:
                     action = int(np.argmax(q_values))
@@ -189,6 +200,7 @@ def main():
     parser.add_argument('--save_freq', type=int, default=None)
     parser.add_argument('--no_save', action='store_true', help='Do not save frames or actions during training')
     parser.add_argument('--use_per', action='store_true', help='Use Prioritized Experience Replay and beta annealing')
+    parser.add_argument('--use_lstm', action='store_true', help='Use DQN with LSTM architecture')
     args = parser.parse_args()
     # Override config if args provided
     if args.max_episodes is not None:
@@ -204,8 +216,9 @@ def main():
     # --- Determine run suffix for naming --- #
     # Extract a short game name, e.g., MsPacman from ALE/MsPacman-v5
     short_game_name = config['env_name'].split('/')[-1].split('-')[0]
+    arch_suffix = "_LSTM" if args.use_lstm else ""
     per_suffix = "_PER" if args.use_per else "_NoPER"
-    run_name_suffix = f"{short_game_name}{per_suffix}"
+    run_name_suffix = f"{short_game_name}{arch_suffix}{per_suffix}"
 
     # --- wandb setup ---
     wandb.init(project="atari-drl-experiments", config=config, name=f"DQN_{run_name_suffix}_{time.strftime('%Y%m%d_%H%M%S')}")
@@ -217,6 +230,8 @@ def main():
         'n_actions': config['n_actions'],
         'state_shape': config['state_shape'],
         'device': device,
+        'use_lstm': args.use_lstm,  # Pass LSTM flag to agent
+        'lstm_hidden_size': config['lstm_hidden_size'] # Pass LSTM hidden size
     }
     if args.use_per:
         agent_params['prioritized'] = True
@@ -312,6 +327,9 @@ def main():
             policy_str = ""
 
         obs, info = env.reset()
+        if args.use_lstm: # If agent uses LSTM, reset its hidden state for the new training episode
+            agent.reset_hidden_state(batch_size=1)
+        
         state_stack = np.array(obs)
         frames, actions, extrinsic_rewards, intrinsic_rewards = [obs[-1]], [], [], [] # Store last frame of initial stack
         total_combined_reward = 0

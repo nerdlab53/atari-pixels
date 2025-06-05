@@ -11,4 +11,5 @@ bulk_videos/
 comparison_frames/
 debug_frames/
 debug/
+model_weights/
 *.mp4
