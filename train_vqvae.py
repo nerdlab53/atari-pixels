@@ -107,12 +107,14 @@ def main():
     
     # Compile the model for potential speedup (requires PyTorch 2.0+)
     # May have a one-time overhead for the first few batches.
-    print("Compiling model with torch.compile()...")
-    try:
-        model = torch.compile(model)
-        print("Model compiled successfully.")
-    except Exception as e:
-        print(f"Warning: Failed to compile model with torch.compile(): {e}. Proceeding without compilation.")
+    # --- TEMPORARILY DISABLING TORCH.COMPILE FOR GRADIENT DEBUGGING ---
+    # print("Compiling model with torch.compile()...")
+    # try:
+    #     model = torch.compile(model)
+    #     print("Model compiled successfully.")
+    # except Exception as e:
+    #     print(f"Warning: Failed to compile model with torch.compile(): {e}. Proceeding without compilation.")
+    # --- END TEMPORARILY DISABLING TORCH.COMPILE ---
 
     if wandb_initialized:
         # Call wandb.watch() AFTER model is initialized and compiled
