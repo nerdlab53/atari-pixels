@@ -40,19 +40,32 @@ def parse_args():
 
     return parser.parse_args()
 
+# --- START: Expert's Solution 5: Check for unused parameters / None gradients ---
+def check_gradients(model, epoch, batch_idx):
+    """Checks and prints names of parameters that have None gradients."""
+    none_grad_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is None:
+            none_grad_params.append(name)
+    if none_grad_params:
+        print(f"Epoch {epoch}, Batch {batch_idx}: Warning! The following parameters have None gradients:")
+        for name in none_grad_params:
+            print(f"  - {name}")
+    # else:
+    #     print(f"Epoch {epoch}, Batch {batch_idx}: All learnable parameters have gradients.")
+# --- END: Expert's Solution 5 ---
+
 def main():
     args = parse_args()
 
     # Setup device, logging, and W&B
     device = setup_device_logging(requested_device=args.device, run_name="VQVAE_Training") 
     
-    # --- RE-ENABLING MOST WANDB FUNCTIONALITY (EXCEPT WATCH) --- 
     if not args.disable_wandb:
         run_name = args.wandb_run_name if args.wandb_run_name else "VQ-VAE-Ms.Pac-Man Training"
         wandb.init(project=args.wandb_project, name=run_name, config=args)
-        # wandb.watch() REMAINS COMMENTED OUT FOR NOW
-        pass 
-    # --- END WANDB RE-ENABLE --- 
+        # Using expert's recommended robust wandb.watch() call
+        wandb.watch(model, log="parameters", log_freq=100, log_graph=False) 
 
     print(f"VQ-VAE Training Configuration:")
     for arg, value in vars(args).items():
@@ -100,7 +113,6 @@ def main():
     except Exception as e:
         print(f"Warning: Failed to compile model with torch.compile(): {e}. Proceeding without compilation.")
 
-    # wandb.watch() remains commented out
     print("Model initialized.")
     print(f"Model parameter count: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -108,9 +120,7 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
-    # TODO: Training loop
-    # TODO: Evaluation/Visualization (e.g., reconstructing a few validation samples)
-    # TODO: Checkpoint saving
+    first_batch_checked_gradients = False # Flag to ensure check_gradients runs only once
 
     print("\nStarting training...")
     for epoch in range(1, args.num_epochs + 1):
@@ -139,6 +149,13 @@ def main():
             )
             
             total_loss.backward()
+
+            # --- START: Call check_gradients after first backward pass of first epoch ---
+            if not first_batch_checked_gradients and epoch == 1 and batch_idx == 0:
+                check_gradients(model, epoch, batch_idx)
+                first_batch_checked_gradients = True
+            # --- END: Call check_gradients ---
+
             optimizer.step()
             
             epoch_total_loss += total_loss.item()
