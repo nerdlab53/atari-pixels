@@ -35,7 +35,7 @@ def encode_frames(args):
         commitment_cost=0.25,
         dropout_p=0.1
     ).to(device)
-    model.load_state_dict(torch.load(args.vqvae_checkpoint, map_location=device)['model_state_dict'])
+    model.load_state_dict(torch.load(args.vqvae_checkpoint, map_location=device, weights_only=False)['model_state_dict'])
     model.eval()
     print("VQ-VAE model loaded.")
 
