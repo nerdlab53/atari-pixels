@@ -4,16 +4,37 @@ import torch.nn.functional as F
 
 def load_latent_action_model(model_path, device):
     model = LatentActionVQVAE()
-    checkpoint = torch.load(model_path, map_location=device)
-    # Fix state dict keys by removing the '*orig*mod.' prefix
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    
+    # Intelligently find the state dict
+    if isinstance(checkpoint, dict):
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            # If no specific key, assume the dict itself is the state_dict
+            state_dict = checkpoint
+    else:
+        # If not a dict, assume the loaded object is the state_dict
+        state_dict = checkpoint
+
+    # Fix state dict keys by removing the '*orig_mod.' prefix for compiled models
     fixed_state_dict = {}
-    for k, v in checkpoint['model'].items():
+    for k, v in state_dict.items():
         if k.startswith('_orig_mod.'):
             fixed_state_dict[k.replace('_orig_mod.', '')] = v
         else:
             fixed_state_dict[k] = v
+            
     model.load_state_dict(fixed_state_dict)
-    return model, checkpoint['step']
+    
+    # Gracefully get step/epoch number
+    step = 0
+    if isinstance(checkpoint, dict):
+        step = checkpoint.get('step', checkpoint.get('epoch', 0))
+        
+    return model, step
 
 class Encoder(nn.Module):
     """
@@ -27,8 +48,8 @@ class Encoder(nn.Module):
     Downsampling calculation for (H, W) = (84, 84):
     Layer 1: (84, 84) -> (42, 42)
     Layer 2: (42, 42) -> (21, 21)
-    Layer 3: (21, 21) -> (11, 11)
-    Layer 4: (11, 11) -> (5, 5)
+    Layer 3: (21, 21) -> (10, 10)
+    Layer 4: (10, 10) -> (5, 5)
     """
     def __init__(self, in_channels=6, hidden_dims=[64, 128, 256, 512], out_dim=128):
         super().__init__()
@@ -63,8 +84,8 @@ class VectorQuantizer(nn.Module):
         self.embedding_dim = embedding_dim
         self.num_embeddings = num_embeddings
         self.commitment_cost = commitment_cost
-        self.embeddings = nn.Embedding(num_embeddings, embedding_dim)
-        self.embeddings.weight.data.uniform_(-1/num_embeddings, 1/num_embeddings)
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding.weight.data.uniform_(-1/num_embeddings, 1/num_embeddings)
 
     def forward(self, z):
         # z: (B, C, H, W)
@@ -74,14 +95,14 @@ class VectorQuantizer(nn.Module):
         
         # Compute L2 distance to codebook
         d = (z_flat.pow(2).sum(1, keepdim=True)
-             - 2 * z_flat @ self.embeddings.weight.t()
-             + self.embeddings.weight.pow(2).sum(1))
+             - 2 * z_flat @ self.embedding.weight.t()
+             + self.embedding.weight.pow(2).sum(1))
         
         # Get nearest codebook indices
         encoding_indices = torch.argmin(d, dim=1)
         
         # Get quantized vectors
-        quantized = self.embeddings(encoding_indices)  # (B*H*W, C)
+        quantized = self.embedding(encoding_indices)  # (B*H*W, C)
         
         # Reshape back to original dimensions
         quantized = quantized.view(z.shape[0], z.shape[2], z.shape[3], self.embedding_dim)  # (B, H, W, C)
@@ -147,10 +168,10 @@ class LatentActionVQVAE(nn.Module):
     - VectorQuantizer: Discretizes latent
     - Decoder: Reconstructs next frame from quantized latent and current frame
     """
-    def __init__(self, codebook_size=256, embedding_dim=128, commitment_cost=0.25):
+    def __init__(self, codebook_size=256, embedding_dim=64, commitment_cost=0.25):
         super().__init__()
         self.encoder = Encoder(out_dim=embedding_dim)
-        self.vq = VectorQuantizer(num_embeddings=codebook_size, embedding_dim=embedding_dim, commitment_cost=commitment_cost)
+        self.quantizer = VectorQuantizer(num_embeddings=codebook_size, embedding_dim=embedding_dim, commitment_cost=commitment_cost)
         self.decoder = Decoder(in_channels=embedding_dim)
 
     def forward(self, frame_t, frame_tp1, return_latent=False):
@@ -159,7 +180,7 @@ class LatentActionVQVAE(nn.Module):
         x = torch.cat([frame_t, frame_tp1], dim=1)  # (B, 2*C, 84, 84)
         
         z = self.encoder(x)  # (B, 128, 5, 5)
-        quantized, indices, commitment_loss, codebook_loss = self.vq(z)
+        quantized, indices, commitment_loss, codebook_loss = self.quantizer(z)
         
         # Decode using current frame as conditioning
         recon = self.decoder(quantized, frame_t)
@@ -170,74 +191,161 @@ class LatentActionVQVAE(nn.Module):
             return recon, indices, commitment_loss, codebook_loss
 
 class ActionToLatentMLP(nn.Module):
-    def __init__(self, input_dim=4, hidden1=512, hidden2=256, latent_dim=35, codebook_size=256, dropout=0.2):
+    """
+    A simple MLP that maps a one-hot encoded action to a sequence of latent codes.
+
+    This model is state-less; it does not consider the current game observation.
+    It learns the most probable latent transition for a given action.
+    """
+    def __init__(self, n_actions=4, latent_seq_len=25, latent_vocab_size=256, dropout_p=0.2):
+        """
+        Args:
+            n_actions (int): The number of possible actions (size of one-hot vector).
+            latent_seq_len (int): The length of the flattened latent code sequence (e.g., 5*5=25).
+            latent_vocab_size (int): The size of the VQ-VAE codebook (e.g., 256).
+            dropout_p (float): Dropout probability.
+        """
         super().__init__()
-        self.latent_dim = latent_dim
-        self.codebook_size = codebook_size
+        self.latent_seq_len = latent_seq_len
+        self.latent_vocab_size = latent_vocab_size
+        
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden1),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden1, hidden2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden2, latent_dim * codebook_size)
+            nn.Linear(n_actions, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
+            # The output layer produces logits for each of the 25 positions in the sequence.
+            nn.Linear(256, latent_seq_len * latent_vocab_size)
         )
 
-    def forward(self, x):
-        out = self.net(x)  # (batch, latent_dim * codebook_size)
-        out = out.view(-1, self.latent_dim, self.codebook_size)
-        return out
+    def forward(self, action_one_hot: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the model.
+        Args:
+            action_one_hot: A batch of one-hot encoded actions. Shape: (B, n_actions)
+        Returns:
+            logits: The output logits. Shape: (B, latent_seq_len, latent_vocab_size)
+        """
+        logits = self.net(action_one_hot)
+        # Reshape the output to be (Batch, Sequence Length, Vocabulary Size)
+        # This is the format expected by the CrossEntropyLoss when comparing with the target.
+        return logits.view(-1, self.latent_seq_len, self.latent_vocab_size)
 
-    def sample_latents(self, logits, temperature=1.0):
-        # logits: (batch, 35, 256)
-        if temperature <= 0:
-            raise ValueError("Temperature must be > 0")
-        probs = F.softmax(logits / temperature, dim=-1)  # (batch, 35, 256)
-        batch, latent_dim, codebook_size = probs.shape
-        # Sample for each position
-        samples = torch.multinomial(probs.view(-1, codebook_size), 1).view(batch, latent_dim)
-        return samples
+    def sample(self, action_one_hot: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+        """
+        Autoregressively sample a latent code sequence for a given action.
+        Note: This MLP is not autoregressive, so it predicts all positions at once.
+              "Sampling" here means sampling from the predicted probability distribution
+              for each position independently.
+
+        Args:
+            action_one_hot: A batch of one-hot encoded actions. Shape: (B, n_actions)
+            temperature: A factor to control the randomness of sampling.
+                         Higher temperature -> more random. Lower -> more greedy.
+        
+        Returns:
+            sampled_indices: A sequence of sampled latent indices. Shape: (B, latent_seq_len)
+        """
+        self.eval()
+        with torch.no_grad():
+            logits = self.forward(action_one_hot)
+            
+            # Apply temperature to the logits
+            if temperature <= 0:
+                # Greedy decoding for temperature=0 or less
+                return logits.argmax(dim=-1)
+            
+            scaled_logits = logits / temperature
+            
+            # Convert logits to probabilities for each position in the sequence
+            # Shape: (B, latent_seq_len, latent_vocab_size)
+            probs = F.softmax(scaled_logits, dim=-1)
+            
+            # For each position in the sequence, sample one index from its distribution.
+            # We need to reshape for torch.multinomial, which expects 2D input.
+            # (B * latent_seq_len, latent_vocab_size)
+            reshaped_probs = probs.view(-1, self.latent_vocab_size)
+            
+            # Sample 1 index for each of the (B * seq_len) distributions
+            sampled_indices = torch.multinomial(reshaped_probs, num_samples=1)
+            
+            # Reshape back to the desired output shape
+            return sampled_indices.view(-1, self.latent_seq_len)
 
 class ActionStateToLatentMLP(nn.Module):
-    def __init__(self, action_dim=4, hidden1=512, hidden2=256, latent_dim=35, codebook_size=256, dropout=0.2):
+    """
+    An MLP that maps a state (two consecutive frames) and a one-hot encoded action
+    to a sequence of latent codes. This is a more powerful, stateful version of
+    the ActionToLatentMLP.
+    """
+    def __init__(self, n_actions=4, latent_seq_len=25, codebook_size=256, frame_embedding_dim=128, hidden_dim=512, dropout_p=0.2):
         super().__init__()
-        self.latent_dim = latent_dim
+        self.latent_seq_len = latent_seq_len
         self.codebook_size = codebook_size
-        # Frame encoder for 2 RGB frames (6 channels, 210x160)
+        
+        # Frame encoder for 2 RGB frames (6 channels, 84x84)
+        # Follows a standard CNN architecture for feature extraction
         self.frame_encoder = nn.Sequential(
-            nn.Conv2d(6, 16, kernel_size=8, stride=4),  # (B, 16, 51, 39)
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),  # (B, 32, 24, 18)
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2),  # (B, 64, 11, 8)
-            nn.ReLU(),
+            nn.Conv2d(6, 32, kernel_size=8, stride=4, padding=0), # (B, 32, 20, 20)
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0), # (B, 64, 9, 9)
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0), # (B, 64, 7, 7)
+            nn.ReLU(inplace=True),
             nn.Flatten(),
-            nn.Linear(64 * 11 * 8, 128),
-            nn.ReLU(),
+            nn.Linear(64 * 7 * 7, frame_embedding_dim),
+            nn.ReLU(inplace=True),
         )
+        
         # Combined MLP for action + frame features
         self.net = nn.Sequential(
-            nn.Linear(action_dim + 128, hidden1),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden1, hidden2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden2, latent_dim * codebook_size)
+            nn.Linear(n_actions + frame_embedding_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden_dim // 2, latent_seq_len * codebook_size)
         )
 
-    def forward(self, action, frames):
-        # action: (B, 4), frames: (B, 6, 210, 160)
+    def forward(self, action_one_hot: torch.Tensor, frames: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            action_one_hot: (B, n_actions)
+            frames: (B, 6, 84, 84) -- two consecutive RGB frames
+        Returns:
+            logits: (B, latent_seq_len, codebook_size)
+        """
         frame_features = self.frame_encoder(frames)
-        combined = torch.cat([action, frame_features], dim=1)
-        out = self.net(combined)
-        return out.view(-1, self.latent_dim, self.codebook_size)
+        combined = torch.cat([action_one_hot, frame_features], dim=1)
+        logits = self.net(combined)
+        return logits.view(-1, self.latent_seq_len, self.codebook_size)
 
-    def sample_latents(self, logits, temperature=1.0):
-        if temperature <= 0:
-            raise ValueError("Temperature must be > 0")
-        probs = F.softmax(logits / temperature, dim=-1)
-        batch, latent_dim, codebook_size = probs.shape
-        samples = torch.multinomial(probs.view(-1, codebook_size), 1).view(batch, latent_dim)
-        return samples
+    def sample(self, action_one_hot: torch.Tensor, frames: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+        """
+        Sample a latent code sequence for a given action and state.
+        
+        Args:
+            action_one_hot: A batch of one-hot encoded actions. Shape: (B, n_actions)
+            frames: A batch of two consecutive frames. Shape: (B, 6, 84, 84)
+            temperature: A factor to control the randomness of sampling.
+        
+        Returns:
+            sampled_indices: A sequence of sampled latent indices. Shape: (B, latent_seq_len)
+        """
+        self.eval()
+        with torch.no_grad():
+            logits = self.forward(action_one_hot, frames)
+            
+            if temperature <= 0:
+                return logits.argmax(dim=-1)
+            
+            scaled_logits = logits / temperature
+            probs = F.softmax(scaled_logits, dim=-1)
+            
+            reshaped_probs = probs.view(-1, self.codebook_size)
+            sampled_indices = torch.multinomial(reshaped_probs, num_samples=1)
+            
+            return sampled_indices.view(-1, self.latent_seq_len)
