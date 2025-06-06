@@ -30,7 +30,7 @@ def encode_frames(args):
     # Correctly initialize the VQVAE model based on its definition
     model = VQVAE(
         input_channels_per_frame=3,
-        embedding_dim=128,
+        embedding_dim=64,
         num_embeddings=256,
         commitment_cost=0.25,
         dropout_p=0.1
