@@ -44,14 +44,26 @@ def create_value_dataset(world_model_data_path, rewards_path, terminals_path, ou
         running_add = rewards[i] + discount_factor * running_add
         discounted_rewards[i] = running_add
         
-    print("Processing data into (latent_state, discounted_reward) tuples...")
+    # --- Normalize the discounted rewards ---
+    # This is a critical step to stabilize training.
+    reward_mean = np.mean(discounted_rewards)
+    reward_std = np.std(discounted_rewards)
+    
+    # Avoid division by zero if all rewards are the same
+    if reward_std == 0:
+        reward_std = 1
+        
+    normalized_rewards = (discounted_rewards - reward_mean) / reward_std
+    print(f"Rewards normalized: mean={reward_mean:.2f}, std={reward_std:.2f}")
+
+    print("Processing data into (latent_state, normalized_reward) tuples...")
     value_model_data = []
     for i in tqdm(range(len(world_data)), desc="Creating value tuples"):
         transition = world_data[i]
         
         value_model_data.append({
             "latent_state": transition['next_latent'],
-            "reward": float(discounted_rewards[i])
+            "reward": float(normalized_rewards[i]) # Use the normalized reward
         })
 
     # Ensure the output directory exists.
@@ -61,6 +73,13 @@ def create_value_dataset(world_model_data_path, rewards_path, terminals_path, ou
     print(f"Saving {len(value_model_data)} tuples to {output_path}...")
     with open(output_path, 'w') as f:
         json.dump(value_model_data, f, indent=2)
+        
+    # --- Save normalization stats ---
+    # We need these to un-normalize the model's predictions during inference.
+    stats_path = os.path.join(output_dir, 'reward_normalization_stats.json')
+    with open(stats_path, 'w') as f:
+        json.dump({'mean': reward_mean, 'std': reward_std}, f, indent=2)
+    print(f"Reward normalization stats saved to {stats_path}")
     
     print("Value model dataset creation complete.")
 
