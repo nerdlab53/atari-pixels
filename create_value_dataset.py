@@ -78,7 +78,7 @@ def create_value_dataset(world_model_data_path, rewards_path, terminals_path, ou
     # We need these to un-normalize the model's predictions during inference.
     stats_path = os.path.join(output_dir, 'reward_normalization_stats.json')
     with open(stats_path, 'w') as f:
-        json.dump({'mean': reward_mean, 'std': reward_std}, f, indent=2)
+        json.dump({'mean': float(reward_mean), 'std': float(reward_std)}, f, indent=2)
     print(f"Reward normalization stats saved to {stats_path}")
     
     print("Value model dataset creation complete.")
