@@ -31,6 +31,7 @@ def generate_data(args):
     # --- Data Storage ---
     actions_log = []
     rewards_log = []
+    terminals_log = []
 
     # --- Gameplay Loop ---
     # Reset the environment to get the initial state
@@ -56,6 +57,9 @@ def generate_data(args):
         # 3. Log the reward received
         rewards_log.append(reward)
 
+        # 4. Log the termination status
+        terminals_log.append(terminated or truncated)
+
         # Check if the episode has ended
         if terminated or truncated:
             # print(f"\nEpisode finished at step {step}. Resetting environment.")
@@ -75,6 +79,11 @@ def generate_data(args):
     with open(rewards_path, 'w') as f:
         json.dump(rewards_log, f)
     print(f"Rewards saved to {rewards_path}")
+
+    terminals_path = os.path.join(os.path.dirname(args.frames_dir), 'terminals.json')
+    with open(terminals_path, 'w') as f:
+        json.dump(terminals_log, f)
+    print(f"Termination signals saved to {terminals_path}")
 
     env.close()
     print("\nData generation complete.")
