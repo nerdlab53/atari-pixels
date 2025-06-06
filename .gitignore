@@ -12,4 +12,6 @@ comparison_frames/
 debug_frames/
 debug/
 model_weights/
+model-checkpoints/
+world_model_checkpoints/
 *.mp4
