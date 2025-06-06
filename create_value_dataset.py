@@ -51,7 +51,7 @@ def create_value_dataset(world_model_data_path, rewards_path, terminals_path, ou
         
         value_model_data.append({
             "latent_state": transition['next_latent'],
-            "reward": discounted_rewards[i]
+            "reward": float(discounted_rewards[i])
         })
 
     # Ensure the output directory exists.
