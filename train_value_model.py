@@ -107,13 +107,15 @@ def main():
     
     # --- Training Setup ---
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
-    criterion = nn.MSELoss() # Use Mean Squared Error for reward prediction
+    criterion_mse = nn.MSELoss() # Use Mean Squared Error for the primary loss function
+    criterion_mae = nn.L1Loss()  # Use L1 Loss to calculate Mean Absolute Error for logging
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     # --- Training Loop ---
     for epoch in range(1, args.num_epochs + 1):
         model.train()
-        total_loss = 0
+        total_mse_loss = 0
+        total_mae_loss = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs}")
         for batch in pbar:
@@ -123,35 +125,50 @@ def main():
             optimizer.zero_grad()
             
             predicted_reward = model(latent_state)
-            loss = criterion(predicted_reward, reward_target)
             
+            # Use MSE for backpropagation
+            loss = criterion_mse(predicted_reward, reward_target)
             loss.backward()
             optimizer.step()
             
-            total_loss += loss.item()
-            pbar.set_postfix({"mse_loss": loss.item()})
+            total_mse_loss += loss.item()
 
-        avg_train_loss = total_loss / len(train_loader)
+            # Calculate MAE for logging purposes
+            with torch.no_grad():
+                mae = criterion_mae(predicted_reward, reward_target)
+                total_mae_loss += mae.item()
+
+            pbar.set_postfix({"mse_loss": f"{loss.item():.4f}", "mae": f"{mae.item():.4f}"})
+
+        avg_train_mse = total_mse_loss / len(train_loader)
+        avg_train_mae = total_mae_loss / len(train_loader)
         
         # --- Validation Loop ---
         model.eval()
-        val_loss = 0
+        val_mse_loss = 0
+        val_mae_loss = 0
         with torch.no_grad():
             for batch in val_loader:
                 latent_state = batch['latent_state'].to(device)
                 reward_target = batch['reward'].to(device)
                 
                 predicted_reward = model(latent_state)
-                loss = criterion(predicted_reward, reward_target)
-                val_loss += loss.item()
+                mse = criterion_mse(predicted_reward, reward_target)
+                mae = criterion_mae(predicted_reward, reward_target)
+                val_mse_loss += mse.item()
+                val_mae_loss += mae.item()
         
-        avg_val_loss = val_loss / len(val_loader)
-        print(f"Epoch {epoch}: Train MSE: {avg_train_loss:.6f}, Val MSE: {avg_val_loss:.6f}")
+        avg_val_mse = val_mse_loss / len(val_loader)
+        avg_val_mae = val_mae_loss / len(val_loader)
+        
+        print(f"Epoch {epoch}: Train MSE: {avg_train_mse:.6f}, Train MAE: {avg_train_mae:.6f} | Val MSE: {avg_val_mse:.6f}, Val MAE: {avg_val_mae:.6f}")
 
         if not args.disable_wandb:
             wandb.log({
-                "train/mse_loss": avg_train_loss,
-                "val/mse_loss": avg_val_loss,
+                "train/mse_loss": avg_train_mse,
+                "train/mae_loss": avg_train_mae,
+                "val/mse_loss": avg_val_mse,
+                "val/mae_loss": avg_val_mae,
                 "epoch": epoch
             })
             
