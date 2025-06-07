@@ -70,10 +70,16 @@ class AtariFramePairDataset(Dataset):
         return arr
 
     def __getitem__(self, idx):
-        frame_t_path, frame_tp1_path = self.pairs[idx]
-        frame_t = self._load_frame(frame_t_path)
-        frame_tp1 = self._load_frame(frame_tp1_path)
-        return torch.from_numpy(frame_t), torch.from_numpy(frame_tp1)
+        try:
+            frame_t_path, frame_tp1_path = self.pairs[idx]
+            frame_t = self._load_frame(frame_t_path)
+            frame_tp1 = self._load_frame(frame_tp1_path)
+            return torch.from_numpy(frame_t), torch.from_numpy(frame_tp1)
+        except OSError as e:
+            print(f"Warning: Caught OSError on file path {self.pairs[idx]}. Error: {e}")
+            print("Skipping this sample and trying a random one.")
+            new_idx = random.randint(0, len(self) - 1)
+            return self.__getitem__(new_idx)
 
 class ActionLatentPairDataset(Dataset):
     def __init__(self, json_path):

@@ -11,4 +11,9 @@ bulk_videos/
 comparison_frames/
 debug_frames/
 debug/
+model_weights/
+model-checkpoints/
+world_model_checkpoints/
+action-latent-data/
+action_mapping_checkpoints/
 *.mp4
