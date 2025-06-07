@@ -113,13 +113,13 @@ The final set of experiments focused on simplifying the model and finding the "s
 The progression from poor to improved reconstructions can be observed in these training snapshots from the final 64-dimensional model:
 
 - **Early Training (Step 30,791):** Initial reconstruction attempts showing the model beginning to learn basic structure:
-  - ![Early Training Reconstruction](./reconstructions-assets/media_images_train_epoch_reconstructions_30791_5a3efc12500f46afff90.png)
+  - ![Early Training Reconstruction](./reconstructions/media_images_train_epoch_reconstructions_30791_5a3efc12500f46afff90.png)
   
 - **Mid Training (Step 41,326):** Improved reconstruction quality as the model learns better representations:
-  - ![Mid Training Reconstruction](./reconstructions-assets/media_images_train_epoch_reconstructions_41326_d2fa1c1eab0139610027.png)
+  - ![Mid Training Reconstruction](./reconstructions/media_images_train_epoch_reconstructions_41326_d2fa1c1eab0139610027.png)
   
 - **Late Training (Step 44,386):** Final reconstruction quality showing the model's ability to capture game dynamics:
-  - ![Late Training Reconstruction](./reconstructions-assets/media_images_train_epoch_reconstructions_44386_c9eced82a94cfc5a7cf7.png)
+  - ![Late Training Reconstruction](./reconstructions/media_images_train_epoch_reconstructions_44386_c9eced82a94cfc5a7cf7.png)
 
 ### Comprehensive Latent Space Analysis
 
