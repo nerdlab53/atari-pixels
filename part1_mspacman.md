@@ -157,4 +157,4 @@ This section outlines the implementation status based on the original project pl
   - Before this project, I had not done any practical deep RL experiments, only theoretical works such as learning about Bellman Equations for Q value estimation, Deep Q Nets, Values, Policies etc. This phase of the project really made me work on those skills finally and I was able to learn a lot about Deep RL and as well as the Atari simulation environment, it has been fruitful for even my growth.
 
   - A video of the agent playing the game : 
-    - [![Watch a PER Agent](./agent-playing/pacman_playing.png)](./agent-playing/mspacman_per.mp4)
+    - [![Watch a PER Agent](./agent-playing/pacman_playing.png)](https://drive.google.com/file/d/1v3zSS4J9-GTF5NI9Vzb9G68OcERwJ6h2/view?usp=sharing)
